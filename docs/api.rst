@@ -25,6 +25,13 @@ Below is a list of top-level API functions that are available in ``xcdat``.
     decode_time
     swap_lon_axis
     compare_datasets
+    reconcile_versions
+    reconcile_datasets
+    monthly_mean
+    valid_duration
+    version_provenance
+    version_conflicts
+    monthly_provenance
     get_dim_coords
     get_dim_keys
     get_coords_by_name

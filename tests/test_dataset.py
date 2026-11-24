@@ -15,6 +15,7 @@ from xcdat.dataset import (
     open_dataset,
     open_mfdataset,
 )
+from xcdat.versioning import version_provenance
 
 logger = _setup_custom_logger("xcdat.dataset", propagate=True)
 
@@ -563,6 +564,56 @@ class TestOpenMfDataset:
         expected = expected.chunk(chunks={"time": 15, "bnds": 2})
 
         assert result.identical(expected)
+
+
+class TestOpenMfDatasetVersioned:
+    @pytest.fixture(autouse=True)
+    def setUp(self, tmp_path):
+        self.dir = tmp_path / "versioned"
+        self.dir.mkdir()
+
+    def _write(self, ds, name, version):
+        path = self.dir / name
+        ds = ds.copy()
+        ds.attrs["version"] = version
+        ds["time"].encoding.update(
+            {"units": "days since 2000-01-01 00:00:00", "calendar": "standard"}
+        )
+        ds["time_bnds"].encoding.update(
+            {"units": "days since 2000-01-01 00:00:00", "calendar": "standard"}
+        )
+        ds.to_netcdf(path)
+        return path
+
+    def test_reconciles_overlapping_files_by_version(self):
+        old = generate_dataset(decode_times=True, cf_compliant=True, has_bounds=True)
+        # Subset the "new" file to February-March so it only corrects part of
+        # the old record.
+        new = old.isel(time=slice(1, 3)).copy()
+        self._write(old, "old.nc", 1)
+        self._write(new, "new.nc", 2)
+
+        result = open_mfdataset(self.dir, data_var="ts", version="version")
+
+        files = [segment.file for segment in version_provenance(result)]
+        assert any(name.endswith("new.nc") for name in files)
+        assert any(name.endswith("old.nc") for name in files)
+        # January and the tail of the old record remain from version 1.
+        assert result["source_version"].values.tolist()[0] == "1"
+        assert result["source_version"].values.tolist()[-1] == "1"
+
+    def test_preprocess_is_rejected_with_version(self):
+        ds = generate_dataset(decode_times=True, cf_compliant=True, has_bounds=True)
+        self._write(ds, "a.nc", 1)
+        self._write(ds, "b.nc", 2)
+
+        with pytest.raises(ValueError, match="preprocess"):
+            open_mfdataset(
+                self.dir,
+                data_var="ts",
+                version="version",
+                preprocess=lambda x: x,
+            )
 
 
 class TestDecodeTime:

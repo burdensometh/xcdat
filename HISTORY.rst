@@ -2,6 +2,20 @@
 History
 =======
 
+Unreleased
+----------
+
+Enhancements
+~~~~~~~~~~~~
+
+- Add version-aware reconciliation for overlapping multi-file datasets. New
+  :py:func:`xcdat.reconcile_versions` (also reachable through
+  ``open_mfdataset(..., version=...)``) resolves overlaps by an explicit
+  version, records and excludes same-version conflicts, tracks per-interval and
+  per-month provenance, and computes duration-weighted monthly means with
+  :py:func:`xcdat.monthly_mean`. Results are independent of file order and
+  idempotent to duplicate inputs.
+
 v0.11.5 (08 October 2026)
 -------------------------
 

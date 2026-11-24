@@ -250,6 +250,53 @@ For more information on these options, visit the `xarray.open_mfdataset`_ docume
 
 .. _`xarray.open_mfdataset`: https://xarray.pydata.org/en/stable/generated/xarray.open_mfdataset.html#xarray-open-mfdataset
 
+How do I merge overlapping files from different dataset versions?
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Data providers sometimes publish a new version of a dataset that only corrects
+part of an older observation period. Concatenating those files with
+``xarray.open_mfdataset()`` produces duplicate, non-monotonic time coordinates
+and cannot express which record should win where they overlap.
+
+Use :py:func:`xcdat.reconcile_versions` (or ``open_mfdataset(..., version=...)``)
+to reconcile overlapping records by an **explicit version**. Where files
+overlap, the highest version wins; parts of the older record that the newer
+files do not cover remain valid.
+
+.. code-block:: python
+
+  >>> # Read the version from the "version" global attribute of each file.
+  >>> ds = xcdat.reconcile_versions("path/to/files/*.nc", data_var="ts")
+  >>>
+  >>> # Or map each file to an explicit version.
+  >>> ds = xcdat.reconcile_versions(
+  ...     ["path/to/old.nc", "path/to/new.nc"],
+  ...     data_var="ts",
+  ...     version={"old.nc": 1, "new.nc": 2},
+  ... )
+
+When two files share the same version but disagree about a value, the interval
+is recorded as a conflict and excluded from the record so it cannot corrupt an
+aggregate. Inspect the outcome with:
+
+.. code-block:: python
+
+  >>> xcdat.version_conflicts(ds)     # intervals excluded due to conflicts
+  >>> xcdat.version_provenance(ds)    # source file/version of each interval
+  >>> xcdat.monthly_provenance(ds)    # source of each month's contribution
+
+Monthly statistics weight each interval by its actual duration, so partial
+months contributed by a short correction file are handled correctly:
+
+.. code-block:: python
+
+  >>> monthly = xcdat.monthly_mean(ds, "ts")
+  >>> monthly["ts"]                 # duration-weighted monthly mean
+  >>> monthly["valid_duration"]     # seconds of valid data per month
+  >>> monthly["conflict_duration"]  # seconds excluded per month due to conflicts
+
+The result is independent of file order and is unaffected by passing the same
+file more than once.
+
 Regridding
 ----------
 ``xcdat`` extends and provides a uniform interface to `xESMF`_ and `xgcm`_. In addition,

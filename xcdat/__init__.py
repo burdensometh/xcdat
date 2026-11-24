@@ -25,6 +25,15 @@ from xcdat.regridder.grid import (  # noqa: F401
 from xcdat.spatial import SpatialAccessor  # noqa: F401
 from xcdat.temporal import TemporalAccessor  # noqa: F401
 from xcdat.utils import compare_datasets  # noqa: F401
+from xcdat.versioning import (  # noqa: F401
+    monthly_mean,
+    monthly_provenance,
+    reconcile_datasets,
+    reconcile_versions,
+    valid_duration,
+    version_conflicts,
+    version_provenance,
+)
 
 # Initialize xCDAT logger once when the package is imported
 _setup_xcdat_logger()

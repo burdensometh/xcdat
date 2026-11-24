@@ -139,6 +139,7 @@ def open_mfdataset(
         "no_conflicts", "override", "equals", "identical", "broadcast_equals"
     ] = "no_conflicts",
     join: Literal["outer", "exact", "left", "right", "inner", "override"] = "outer",
+    version: Any = None,
     **kwargs: dict[str, Any],
 ) -> xr.Dataset:
     """Wraps ``xarray.open_mfdataset()`` with post-processing options.
@@ -248,6 +249,16 @@ def open_mfdataset(
           * "override": if indexes are of same size, rewrite indexes to be
             those of the first object with that dimension. Indexes for the same
             dimension must have the same size in all objects.
+    version : Any, optional
+        If provided, reconcile overlapping files by this explicit version
+        instead of concatenating them with ``xarray.open_mfdataset``. Higher
+        versions win where files overlap in time, uncovered parts of older
+        files remain valid, and same-version disagreements are recorded as
+        conflicts and excluded from aggregation. See
+        :py:func:`xcdat.reconcile_versions` for the accepted values (a global
+        attribute name, a path-to-version mapping, a callable, or a sequence of
+        versions aligned with ``paths``). By default None, which preserves the
+        standard concatenation behavior.
 
     **kwargs : dict[str, Any]
         Additional arguments passed on to ``xarray.open_mfdataset``. Refer to
@@ -273,6 +284,26 @@ def open_mfdataset(
     if isinstance(paths, str) or isinstance(paths, pathlib.Path):
         if os.path.isdir(paths):
             paths = _parse_dir_for_nc_glob(paths)
+
+    if version is not None:
+        from xcdat.versioning import reconcile_versions
+
+        if preprocess is not None:
+            raise ValueError(
+                "The `preprocess` argument is not supported when reconciling "
+                "versioned files with `version=`. Use `xcdat.reconcile_versions()` "
+                "directly if custom per-file preprocessing is required."
+            )
+        return reconcile_versions(
+            paths,
+            data_var=data_var,
+            version=version,
+            decode_times=decode_times,
+            add_bounds=add_bounds,
+            center_times=center_times,
+            lon_orient=lon_orient,
+            **kwargs,  # type: ignore
+        )
 
     # Add internal preprocessing to user-defined preprocessing (if provided).
     preprocess = partial(_preprocess, decode_times=decode_times, callable=preprocess)
