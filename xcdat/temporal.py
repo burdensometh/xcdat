@@ -3,7 +3,7 @@
 import warnings
 from datetime import datetime
 from itertools import chain
-from typing import Callable, Literal, TypedDict, get_args
+from typing import Callable, Iterable, Literal, TypedDict, get_args
 
 import cf_xarray  # noqa: F401
 import cftime
@@ -913,6 +913,384 @@ class TemporalAccessor:
             ds_departs = self._keep_weights(ds_departs)
 
         return ds_departs
+
+    def accumulate(self, data_var: str, freq: Frequency = "month") -> xr.Dataset:
+        """Accumulates a data variable into time groups for later merging.
+
+        This method does not compute a final average. Instead, it splits each
+        source time step's bounds at the target group boundaries and accumulates
+        the pieces of data that fall into each group. The result is an
+        intermediate "accumulator" that can be combined across files with
+        :meth:`merge_accumulators` before a final average is taken.
+
+        This is useful when a time series is delivered in many files that do not
+        align with group boundaries (for example, 4-hourly samples split into
+        arbitrary files). A sample whose bounds straddle a boundary contributes
+        only the fraction of its duration that overlaps each group.
+
+        Parameters
+        ----------
+        data_var : str
+            The key of the data variable to accumulate.
+        freq : {"month", "year"}, optional
+            The output grouping frequency, by default "month". Only "month" and
+            "year" are supported because they are the only groups whose exact
+            duration is defined by their calendar bounds.
+
+        Returns
+        -------
+        xr.Dataset
+            A Dataset with one entry per output time group containing:
+
+            * ``{data_var}_sum``: the sum of data multiplied by the duration (in
+              hours) that each sample overlaps the group. Zero values contribute
+              to the sum and to the valid duration, while missing values
+              (``NaN``) contribute to neither.
+            * ``{data_var}_valid_hours``: the total duration (in hours) of valid
+              data within the group.
+            * ``{data_var}_total_hours``: the total duration (in hours) of the
+              group covered by the source data, whether valid or missing.
+            * ``{time}_bnds``: the bounds of each group that is covered by data.
+
+        Raises
+        ------
+        ValueError
+            If ``freq`` is not "month" or "year".
+        ValueError
+            If the source time bounds overlap each other.
+
+        Notes
+        -----
+        The source data must have time bounds. Bounds are assumed to be ordered
+        ``[lower, upper)``. Missing values are identified with ``isnull()``; a
+        value of zero is treated as a valid observation and contributes its full
+        duration.
+
+        The output does not retain the original time values, only cumulative
+        sums and durations. The size of the intermediate results is therefore
+        proportional to the number of time groups, not the number of source time
+        steps, so it can be written to disk and merged later without keeping the
+        raw data.
+
+        Examples
+        --------
+        Accumulate 4-hourly data into monthly sums and write the result for later
+        merging:
+
+        >>> ds_acc = ds.temporal.accumulate("tas")
+        >>> ds_acc.to_netcdf("tas_accumulator_2000-01.nc")
+        """
+        self._set_data_var_attrs(data_var)
+        self._set_accumulate_attrs(freq)
+
+        ds = self._dataset.copy()
+        ds = self._preprocess_accumulate(ds, data_var)
+
+        return self._accumulate(ds, data_var)
+
+    def merge_accumulators(
+        self, accumulators: Iterable[xr.Dataset], data_var: str
+    ) -> xr.Dataset:
+        """Merges accumulators and returns the final time averages.
+
+        This method sums the intermediate results produced by :meth:`accumulate`
+        across any number of accumulators (for example, one per source file) and
+        divides the accumulated data by the accumulated valid duration to
+        produce the final average. Because the intermediate results only store
+        sums and durations, the original data does not need to be retained.
+
+        Splitting the same input across different accumulators produces the same
+        average and valid duration as accumulating the input in one call, since
+        the sums and durations are additive.
+
+        Parameters
+        ----------
+        accumulators : Iterable[xr.Dataset]
+            The intermediate results produced by :meth:`accumulate`.
+        data_var : str
+            The key of the data variable that was accumulated.
+
+        Returns
+        -------
+        xr.Dataset
+            A Dataset with the final average (``data_var``), the valid duration
+            (``{data_var}_valid_hours``), the covered duration
+            (``{data_var}_total_hours``), and the time group bounds
+            (``{time}_bnds``).
+
+        Raises
+        ------
+        ValueError
+            If no accumulators are provided.
+        ValueError
+            If accumulators have overlapping time coverage.
+
+        Examples
+        --------
+        Merge monthly accumulators and take the final average:
+
+        >>> ds_acc_jan = ds_jan.temporal.accumulate("tas")
+        >>> ds_acc_feb = ds_feb.temporal.accumulate("tas")
+        >>> ds_mean = ds.temporal.merge_accumulators(
+        ...     [ds_acc_jan, ds_acc_feb], "tas"
+        ... )
+        """
+        accumulators = list(accumulators)
+        if len(accumulators) == 0:
+            raise ValueError("At least one accumulator is required.")
+
+        sum_name = f"{data_var}_sum"
+        valid_name = f"{data_var}_valid_hours"
+        total_name = f"{data_var}_total_hours"
+
+        for acc in accumulators:
+            missing = [n for n in (sum_name, valid_name, total_name) if n not in acc]
+            if missing:
+                raise ValueError(
+                    "An accumulator is missing required variables "
+                    f"{missing}. Use `accumulate()` to create accumulators."
+                )
+
+        time_dim = _get_accumulator_time_dim(accumulators[0], sum_name)
+
+        # All accumulators must share the same non-time dimensions so their
+        # sums and durations align cell-by-cell.
+        reference_dims = tuple(d for d in accumulators[0][sum_name].dims)
+        for i, acc in enumerate(accumulators[1:], start=1):
+            if tuple(acc[sum_name].dims) != reference_dims:
+                raise ValueError(
+                    "All accumulators must share the same data dimensions. "
+                    f"Accumulator 0 has {reference_dims}, accumulator {i} has "
+                    f"{tuple(acc[sum_name].dims)}."
+                )
+            for dim in reference_dims:
+                if dim == time_dim:
+                    continue
+                if not acc[dim].equals(accumulators[0][dim]):
+                    raise ValueError(
+                        "All accumulators must share the same coordinates along "
+                        f"dimension {dim!r}."
+                    )
+
+        calendar = _infer_calendar(accumulators[0][time_dim].values)
+        for i, acc in enumerate(accumulators[1:], start=1):
+            other_calendar = _infer_calendar(acc[time_dim].values)
+            if other_calendar != calendar:
+                raise ValueError(
+                    "All accumulators must use the same calendar. "
+                    f"Accumulator 0 uses {calendar!r}, accumulator {i} uses "
+                    f"{other_calendar!r}."
+                )
+
+        # Check for overlapping coverage before summing so overlapping input is
+        # reported instead of being double counted.
+        _check_accumulator_overlaps(accumulators, time_dim, calendar)
+
+        combined_sum = _concat_accumulators(accumulators, sum_name, time_dim)
+        combined_valid = _concat_accumulators(accumulators, valid_name, time_dim)
+        combined_total = _concat_accumulators(accumulators, total_name, time_dim)
+
+        total_sum = combined_sum.sum("_source")
+        valid_hours = combined_valid.sum("_source")
+        total_hours = combined_total.sum("_source")
+
+        avg = total_sum / valid_hours
+        avg.name = data_var
+        avg.attrs = {
+            k: v for k, v in accumulators[0][sum_name].attrs.items()
+            if k not in ("operation", "freq")
+        }
+        avg.attrs.update(
+            {
+                "operation": "temporal_accumulate",
+                "freq": accumulators[0][sum_name].attrs.get("freq", "month"),
+                "merged": "True",
+            }
+        )
+
+        time_bnds = _merge_accumulator_bounds(accumulators, time_dim, calendar)
+        time_coord = total_sum[time_dim]
+        time_coord.attrs["bounds"] = time_bnds.name
+
+        ds = xr.Dataset(coords={time_dim: time_coord})
+        ds[data_var] = avg
+        ds[valid_name] = valid_hours
+        ds[total_name] = total_hours
+        ds[time_bnds.name] = time_bnds
+
+        for name in (valid_name, total_name):
+            ds[name].attrs.update(
+                {
+                    "operation": "temporal_accumulate",
+                    "freq": avg.attrs["freq"],
+                }
+            )
+
+        return ds
+
+    def _set_accumulate_attrs(self, freq: Frequency):
+        """Validates and stores accumulation settings.
+
+        Parameters
+        ----------
+        freq : Frequency
+            The grouping frequency for accumulation.
+
+        Raises
+        ------
+        ValueError
+            If ``freq`` is not "month" or "year".
+        """
+        if freq not in ("month", "year"):
+            raise ValueError(
+                "`freq` must be 'month' or 'year' for `accumulate()`. "
+                f"Got {freq!r}."
+            )
+
+        self._accumulate_freq = freq
+
+    def _preprocess_accumulate(self, ds: xr.Dataset, data_var: str) -> xr.Dataset:
+        """Validates and sorts a dataset for accumulation.
+
+        Parameters
+        ----------
+        ds : xr.Dataset
+            The dataset.
+        data_var : str
+            The key of the data variable.
+
+        Returns
+        -------
+        xr.Dataset
+            The dataset sorted by the lower time bound.
+
+        Raises
+        ------
+        KeyError
+            If time bounds cannot be found for the data variable.
+        """
+        time_bnds = ds.bounds.get_bounds("T", var_key=data_var)
+        bounds_dim = bounds._get_bounds_dim(ds[self.dim], time_bnds)
+        lower = time_bnds.isel({bounds_dim: 0})
+
+        calendar = self.calendar
+        if _is_cftime_values(lower.values):
+            calendar = getattr(lower.values.flat[0], "calendar", calendar)
+
+        order = np.argsort(_time_to_us(lower.values, calendar), kind="stable")
+
+        return ds.isel({self.dim: order})
+
+    def _accumulate(self, ds: xr.Dataset, data_var: str) -> xr.Dataset:
+        """Computes the accumulated sums and durations for a data variable.
+
+        Parameters
+        ----------
+        ds : xr.Dataset
+            The dataset.
+        data_var : str
+            The key of the data variable.
+
+        Returns
+        -------
+        xr.Dataset
+            The accumulator.
+
+        Raises
+        ------
+        ValueError
+            If the source time bounds overlap each other.
+        """
+        dv = _get_data_var(ds, data_var)
+        time_bnds = ds.bounds.get_bounds("T", var_key=data_var)
+        bounds_dim = bounds._get_bounds_dim(dv[self.dim], time_bnds)
+        lower_values = time_bnds.isel({bounds_dim: 0}).values
+        upper_values = time_bnds.isel({bounds_dim: 1}).values
+
+        use_cftime = not np.issubdtype(upper_values.dtype, np.datetime64)
+        calendar = self.calendar
+        date_type = self.date_type
+        if use_cftime:
+            # Prefer the calendar and date type encoded on the actual values in
+            # case the "calendar" encoding attribute was missing and defaulted.
+            calendar = getattr(lower_values.flat[0], "calendar", calendar)
+            date_type = type(lower_values.flat[0])
+
+        lower_us = _time_to_us(lower_values, calendar)
+        upper_us = _time_to_us(upper_values, calendar)
+
+        if np.any(upper_us <= lower_us):
+            raise ValueError(
+                "Time bounds must be ordered from earlier to later "
+                "(lower < upper) for accumulation."
+            )
+
+        _check_overlapping_spans(
+            list(zip(lower_us.tolist(), upper_us.tolist(), strict=False))
+        )
+
+        segments = _split_bounds_by_group(
+            lower_us,
+            upper_us,
+            self._accumulate_freq,
+            use_cftime,
+            calendar,
+            date_type,
+        )
+
+        seg_dim = "_segment"
+        label_da = xr.DataArray(segments["group_index"], dims=[seg_dim], name=self.dim)
+        hours_da = xr.DataArray(segments["hours"], dims=[seg_dim])
+
+        dv_seg = dv.isel({self.dim: segments["step"]}).rename({self.dim: seg_dim})
+
+        # Missing values contribute to neither the data sum nor the valid
+        # duration. A value of zero is valid and contributes its full duration.
+        valid = dv_seg.notnull()
+
+        data_sum = (xr.where(valid, dv_seg, 0.0) * hours_da).groupby(label_da).sum()
+        valid_hours = (valid.astype("float64") * hours_da).groupby(label_da).sum()
+        total_hours = hours_da.groupby(label_da).sum()
+
+        # Replace the integer group labels with the group start times.
+        unique_labels = segments["unique_labels"]
+        data_sum = data_sum.assign_coords({self.dim: unique_labels})
+        valid_hours = valid_hours.assign_coords({self.dim: unique_labels})
+        total_hours = total_hours.assign_coords({self.dim: unique_labels})
+
+        data_sum.name = f"{data_var}_sum"
+        valid_hours.name = f"{data_var}_valid_hours"
+        total_hours.name = f"{data_var}_total_hours"
+
+        time_coord = xr.DataArray(unique_labels, dims=[self.dim], name=self.dim)
+        time_coord.attrs = ds[self.dim].attrs
+        # Preserve calendar/units so accumulators can be written to netCDF and
+        # merged after a round trip.
+        time_coord.encoding = dict(ds[self.dim].encoding)
+
+        time_bnds_out = _build_accumulated_bounds(
+            segments, time_coord, use_cftime, calendar
+        )
+        time_coord.attrs["bounds"] = time_bnds_out.name
+        time_bnds_out.encoding = dict(ds[self.dim].encoding)
+
+        ds_out = xr.Dataset(coords={self.dim: time_coord})
+        ds_out[data_sum.name] = data_sum
+        ds_out[valid_hours.name] = valid_hours
+        ds_out[total_hours.name] = total_hours
+        ds_out[time_bnds_out.name] = time_bnds_out
+
+        # Preserve the data variable's attributes on the sum result.
+        ds_out[data_sum.name].attrs = dv.attrs
+        ds_out[data_sum.name].attrs.update(
+            {"operation": "temporal_accumulate", "freq": self._accumulate_freq}
+        )
+        for name in (valid_hours.name, total_hours.name):
+            ds_out[name].attrs.update(
+                {"operation": "temporal_accumulate", "freq": self._accumulate_freq}
+            )
+
+        return ds_out
 
     def _averager(
         self,
@@ -2247,6 +2625,525 @@ class TemporalAccessor:
         ds_departs[data_var] = dv_departs
 
         return ds_departs
+
+
+# Microseconds per hour. All accumulation durations are computed in integer
+# microseconds so that arbitrary sub-hourly sample lengths are represented
+# exactly.
+_US_PER_HOUR = 3_600_000_000
+
+# The proleptic Gregorian month index of 1970-01 (year 1970, month 1). This
+# offset converts between a (year * 12 + month) index and numpy's
+# ``datetime64[M]`` epoch.
+_MONTH_INDEX_1970_01 = 1970 * 12
+
+
+def _time_to_us(values: np.ndarray, calendar: str) -> np.ndarray:
+    """Converts datetime-like values to integer microseconds since the epoch.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        An array of ``np.datetime64`` or ``cftime.datetime`` objects.
+    calendar : str
+        The CF calendar name, used for ``cftime`` values.
+
+    Returns
+    -------
+    np.ndarray
+        An int64 array of microseconds since 1970-01-01 00:00:00.
+
+    Raises
+    ------
+    TypeError
+        If the values are not datetime-like.
+    """
+    if np.issubdtype(values.dtype, np.datetime64):
+        return values.astype("datetime64[us]").astype(np.int64)
+
+    flat = values.reshape(-1)
+    if flat.size > 0 and isinstance(flat[0], cftime.datetime):
+        return np.rint(
+            cftime.date2num(
+                values, "microseconds since 1970-01-01 00:00:00", calendar=calendar
+            )
+        ).astype(np.int64)
+
+    raise TypeError(
+        "Accumulation requires time values to be decoded as `np.datetime64` or "
+        f"`cftime.datetime` objects. Got {values.dtype}."
+    )
+
+
+def _us_to_time(values: np.ndarray, use_cftime: bool, calendar: str, date_type):
+    """Converts integer microseconds since the epoch back to datetime-like values.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        An int64 array of microseconds since 1970-01-01 00:00:00.
+    use_cftime : bool
+        If True, return ``cftime.datetime`` objects instead of ``np.datetime64``.
+    calendar : str
+        The CF calendar name, used for ``cftime`` values.
+    date_type : type
+        The ``cftime.datetime`` subclass to construct.
+
+    Returns
+    -------
+    np.ndarray
+        An array of ``cftime.datetime`` or ``np.datetime64`` values.
+    """
+    if use_cftime:
+        return np.asarray(
+            cftime.num2date(
+                values,
+                "microseconds since 1970-01-01 00:00:00",
+                calendar=calendar,
+                only_use_cftime_datetimes=True,
+            ),
+            dtype=object,
+        )
+
+    return values.astype("datetime64[us]")
+
+
+def _month_start_us(month_index: np.ndarray, calendar: str) -> np.ndarray:
+    """Returns the epoch microseconds of the first instant of each month.
+
+    Parameters
+    ----------
+    month_index : np.ndarray
+        An integer array where month ``1970-01`` is ``0``, i.e.
+        ``year * 12 + (month - 1)``.
+    calendar : str
+        The CF calendar name.
+
+    Returns
+    -------
+    np.ndarray
+        An int64 array of microseconds since 1970-01-01 00:00:00.
+    """
+    date_type = get_date_type(calendar)
+    years = month_index // 12
+    months = month_index % 12 + 1
+    starts = np.array(
+        [date_type(int(y), int(m), 1) for y, m in zip(years, months, strict=True)],
+        dtype=object,
+    )
+
+    return _time_to_us(starts, calendar)
+
+
+def _split_bounds_by_group(
+    lower_us: np.ndarray,
+    upper_us: np.ndarray,
+    freq: Frequency,
+    use_cftime: bool,
+    calendar: str,
+    date_type,
+) -> dict:
+    """Splits source time bounds at target group boundaries.
+
+    Each source time step's ``[lower, upper)`` bounds are intersected with every
+    target group they touch. The result describes, for each (source step, group)
+    overlap, how many microseconds the step spends in that group.
+
+    Parameters
+    ----------
+    lower_us, upper_us : np.ndarray
+        The source time bounds as microseconds since the epoch.
+    freq : {"month", "year"}
+        The target grouping frequency.
+    use_cftime : bool
+        Whether the source times are ``cftime`` objects.
+    calendar : str
+        The CF calendar name.
+    date_type : type
+        The ``cftime.datetime`` subclass to construct.
+
+    Returns
+    -------
+    dict
+        A dictionary with the keys ``step`` (source time step index per
+        segment), ``group_index`` (integer group label per segment), ``hours``
+        (duration in hours per segment), ``unique_labels`` (sorted group start
+        times), ``group_start_us`` and ``group_end_us`` (per unique group), and
+        ``covered_start_us`` and ``covered_end_us`` (per unique group, the
+        extent of source data).
+    """
+    # Exclusive upper bound: subtract one microsecond so a step ending exactly on
+    # a boundary belongs to the earlier group, not the next one.
+    last_instant_us = upper_us - 1
+
+    start_ym = _month_index(lower_us, use_cftime, calendar, date_type)
+    end_ym = _month_index(last_instant_us, use_cftime, calendar, date_type)
+
+    if freq == "month":
+        first = start_ym
+        last = end_ym
+    elif freq == "year":
+        first = start_ym // 12
+        last = end_ym // 12
+    else:
+        raise ValueError(
+            "`freq` must be 'month' or 'year' for accumulation. "
+            f"Got {freq!r}."
+        )
+
+    first_group, last_group = first, last
+    n_groups = last_group - first_group + 1
+
+    # Expand each source step into one entry per group it overlaps.
+    step = np.repeat(np.arange(len(first_group)), n_groups)
+    offset = np.concatenate([np.arange(n) for n in n_groups]).astype(np.int64)
+    group = first_group[step] + offset
+
+    unique_groups = np.unique(group)
+    if freq == "month":
+        starts_us = _month_start_us(unique_groups, calendar)
+        ends_us = _month_start_us(unique_groups + 1, calendar)
+    else:
+        starts_us = _month_start_us(unique_groups * 12, calendar)
+        ends_us = _month_start_us((unique_groups + 1) * 12, calendar)
+
+    # Map the absolute group id to its position in the unique, sorted array.
+    positions = np.searchsorted(unique_groups, group)
+
+    overlap_start = np.maximum(lower_us[step], starts_us[positions])
+    overlap_end = np.minimum(upper_us[step], ends_us[positions])
+    hours = (overlap_end - overlap_start) / _US_PER_HOUR
+
+    unique_labels = _us_to_time(starts_us, use_cftime, calendar, date_type)
+
+    # The covered extent of each group is the union of its overlapping source
+    # bounds. Using min/max of the overlaps is exact because the source bounds
+    # are sorted and non-overlapping.
+    covered_start = np.full(len(unique_groups), np.iinfo(np.int64).max, dtype=np.int64)
+    covered_end = np.full(len(unique_groups), np.iinfo(np.int64).min, dtype=np.int64)
+    np.minimum.at(covered_start, positions, overlap_start)
+    np.maximum.at(covered_end, positions, overlap_end)
+
+    return {
+        "step": step,
+        "group_index": unique_groups.searchsorted(group),
+        "hours": hours,
+        "unique_labels": unique_labels,
+        "group_start_us": starts_us,
+        "group_end_us": ends_us,
+        "covered_start_us": covered_start,
+        "covered_end_us": covered_end,
+        "n_groups": len(unique_groups),
+    }
+
+
+def _month_index(
+    values_us: np.ndarray, use_cftime: bool, calendar: str, date_type
+) -> np.ndarray:
+    """Returns the ``year * 12 + (month - 1)`` index for epoch microseconds.
+
+    Parameters
+    ----------
+    values_us : np.ndarray
+        Microseconds since 1970-01-01 00:00:00.
+    use_cftime : bool
+        Whether to interpret the values with ``cftime``.
+    calendar : str
+        The CF calendar name.
+    date_type : type
+        The ``cftime.datetime`` subclass.
+
+    Returns
+    -------
+    np.ndarray
+        An int64 array of month indexes.
+    """
+    dates = _us_to_time(values_us, use_cftime, calendar, date_type)
+
+    if use_cftime:
+        years = np.array([d.year for d in dates], dtype=np.int64)
+        months = np.array([d.month for d in dates], dtype=np.int64)
+        return years * 12 + (months - 1)
+
+    # numpy's ``datetime64[M]`` epoch is 1970-01 (index 0). Shift it to the
+    # absolute ``year * 12 + (month - 1)`` index used for cftime as well.
+    month_since_epoch = dates.astype("datetime64[M]").astype(np.int64)
+    return month_since_epoch + _MONTH_INDEX_1970_01
+
+
+def _build_accumulated_bounds(
+    segments: dict,
+    time_coord: xr.DataArray,
+    use_cftime: bool,
+    calendar: str,
+) -> xr.DataArray:
+    """Builds the time bounds variable for an accumulator.
+
+    Parameters
+    ----------
+    segments : dict
+        The output of :func:`_split_bounds_by_group`.
+    time_coord : xr.DataArray
+        The output time coordinate.
+    use_cftime : bool
+        Whether to produce ``cftime`` bounds.
+    calendar : str
+        The CF calendar name.
+
+    Returns
+    -------
+    xr.DataArray
+        The bounds with dimensions ``(time, bnds)``.
+    """
+    date_type = get_date_type(calendar)
+    start = _us_to_time(
+        segments["covered_start_us"], use_cftime, calendar, date_type
+    )
+    end = _us_to_time(segments["covered_end_us"], use_cftime, calendar, date_type)
+
+    bnds = np.stack([start, end], axis=-1)
+    if not use_cftime:
+        bnds = bnds.astype("datetime64[ns]")
+
+    name = f"{time_coord.name}_bnds"
+    bnds_da = xr.DataArray(
+        bnds,
+        dims=(time_coord.dims[0], "bnds"),
+        coords={time_coord.dims[0]: time_coord},
+        name=name,
+    )
+    bnds_da.attrs = {"xcdat_bounds": "True"}
+
+    return bnds_da
+
+
+def _check_overlapping_spans(spans: list[tuple[int, int]]) -> None:
+    """Checks that ``[lower, upper)`` spans do not overlap.
+
+    Parameters
+    ----------
+    spans : list[tuple[int, int]]
+        The spans as ``(lower, upper)`` epoch microseconds.
+
+    Raises
+    ------
+    ValueError
+        If any two spans overlap.
+    """
+    ordered = sorted(spans)
+    max_end = None
+    for start, end in ordered:
+        if max_end is not None and start < max_end:
+            raise ValueError(
+                "The time bounds of the source data overlap. Overlapping data "
+                "cannot be accumulated because the overlap would be counted "
+                "more than once. Remove or trim the overlapping time steps "
+                "before accumulating."
+            )
+        max_end = end if max_end is None else max(max_end, end)
+
+
+def _get_accumulator_time_dim(ds: xr.Dataset, var_name: str) -> str:
+    """Returns the time dimension name from an accumulator.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        The accumulator.
+    var_name : str
+        A variable in the accumulator that has the time dimension.
+
+    Returns
+    -------
+    str
+        The time dimension name.
+    """
+    time_coords = [str(dim) for dim in get_dim_coords(ds[var_name], "T").dims]
+
+    return time_coords[-1]
+
+
+def _concat_accumulators(
+    accumulators: list[xr.Dataset], var_name: str, time_dim: str
+) -> xr.DataArray:
+    """Concatenates a variable from multiple accumulators along a new dimension.
+
+    Parameters
+    ----------
+    accumulators : list[xr.Dataset]
+        The accumulators.
+    var_name : str
+        The variable to concatenate.
+    time_dim : str
+        The time dimension name.
+
+    Returns
+    -------
+    xr.DataArray
+        The concatenated variable with a ``"_source"`` dimension.
+    """
+    arrays = [acc[var_name] for acc in accumulators]
+    combined = xr.concat(
+        arrays, dim="_source", join="outer", fill_value=0.0, coords="minimal"
+    )
+
+    return combined
+
+
+def _merge_accumulator_bounds(
+    accumulators: list[xr.Dataset], time_dim: str, calendar: str
+) -> xr.DataArray:
+    """Merges the time bounds of multiple accumulators.
+
+    Multiple accumulators can contribute to the same output time group (for
+    example, two files that each cover part of the same month). This function
+    combines their covered spans per group by taking the earliest lower bound
+    and the latest upper bound.
+
+    Parameters
+    ----------
+    accumulators : list[xr.Dataset]
+        The accumulators.
+    time_dim : str
+        The time dimension name.
+    calendar : str
+        The CF calendar name.
+
+    Returns
+    -------
+    xr.DataArray
+        The merged bounds with dimensions ``(time, bnds)``.
+    """
+    # Collect the covered span of each group across all accumulators, keyed by
+    # the epoch microseconds of the group label.
+    starts: dict[int, int] = {}
+    ends: dict[int, int] = {}
+    label_us: dict[int, int] = {}
+
+    for acc in accumulators:
+        bnds = acc.bounds.get_bounds("T")
+        bounds_dim = bounds._get_bounds_dim(acc[time_dim], bnds)
+        lower = _time_to_us(bnds.isel({bounds_dim: 0}).values, calendar)
+        upper = _time_to_us(bnds.isel({bounds_dim: 1}).values, calendar)
+        labels = _time_to_us(acc[time_dim].values, calendar)
+
+        for lab, lo, hi in zip(labels, lower, upper, strict=True):
+            lab = int(lab)
+            lo = int(lo)
+            hi = int(hi)
+            label_us[lab] = lab
+            starts[lab] = min(starts.get(lab, lo), lo)
+            ends[lab] = max(ends.get(lab, hi), hi)
+
+    ordered = sorted(label_us)
+    use_cftime = _is_cftime_values(accumulators[0][time_dim].values)
+    date_type = get_date_type(calendar)
+
+    labels = _us_to_time(
+        np.array(ordered, dtype=np.int64), use_cftime, calendar, date_type
+    )
+    lower_vals = _us_to_time(
+        np.array([starts[k] for k in ordered], dtype=np.int64),
+        use_cftime,
+        calendar,
+        date_type,
+    )
+    upper_vals = _us_to_time(
+        np.array([ends[k] for k in ordered], dtype=np.int64),
+        use_cftime,
+        calendar,
+        date_type,
+    )
+
+    bnds = np.stack([lower_vals, upper_vals], axis=-1)
+    if not use_cftime:
+        bnds = bnds.astype("datetime64[ns]")
+
+    time_coord = xr.DataArray(labels, dims=[time_dim], name=time_dim)
+    time_coord.attrs = accumulators[0][time_dim].attrs
+
+    merged = xr.DataArray(
+        bnds,
+        dims=(time_dim, "bnds"),
+        coords={time_dim: time_coord},
+        name=f"{time_dim}_bnds",
+    )
+    merged.attrs = {"xcdat_bounds": "True"}
+    merged.encoding = dict(accumulators[0][time_dim].encoding)
+
+    return merged
+
+
+def _is_cftime_values(values: np.ndarray) -> bool:
+    """Returns True if the array holds ``cftime.datetime`` objects."""
+    flat = values.reshape(-1)
+    return flat.size > 0 and isinstance(flat[0], cftime.datetime)
+
+
+
+def _check_accumulator_overlaps(
+    accumulators: list[xr.Dataset], time_dim: str, calendar: str
+) -> None:
+    """Checks that accumulators do not cover overlapping time periods.
+
+    Parameters
+    ----------
+    accumulators : list[xr.Dataset]
+        The accumulators.
+    time_dim : str
+        The time dimension name.
+    calendar : str
+        The CF calendar name.
+
+    Raises
+    ------
+    ValueError
+        If accumulators cover overlapping time periods.
+    """
+    spans: list[tuple[int, int]] = []
+    for i, acc in enumerate(accumulators):
+        bnds = acc.bounds.get_bounds("T")
+        bounds_dim = bounds._get_bounds_dim(acc[time_dim], bnds)
+        lower = _time_to_us(bnds.isel({bounds_dim: 0}).values, calendar)
+        upper = _time_to_us(bnds.isel({bounds_dim: 1}).values, calendar)
+        spans.extend(
+            (int(lo), int(hi), i) for lo, hi in zip(lower, upper, strict=True)
+        )
+
+    ordered = sorted(spans)
+    max_end = None
+    max_end_index = None
+    for start, end, index in ordered:
+        if max_end is not None and start < max_end:
+            raise ValueError(
+                "Accumulators cover overlapping time periods "
+                f"(accumulators {max_end_index} and {index}). Overlapping data "
+                "would be counted more than once. Remove or trim the "
+                "overlapping time steps before accumulating."
+            )
+        if max_end is None or end > max_end:
+            max_end = end
+            max_end_index = index
+
+
+def _infer_calendar(values: np.ndarray) -> str:
+    """Infers the CF calendar from datetime-like values.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        An array of ``np.datetime64`` or ``cftime.datetime`` values.
+
+    Returns
+    -------
+    str
+        The CF calendar name.
+    """
+    if np.issubdtype(values.dtype, np.datetime64):
+        return "standard"
+
+    first = values.flat[0]
+    return getattr(first, "calendar", "standard")
 
 
 def _infer_freq(time_coords: xr.DataArray) -> Frequency:

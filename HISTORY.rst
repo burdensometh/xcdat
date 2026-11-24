@@ -2,6 +2,23 @@
 History
 =======
 
+Unreleased
+----------
+
+This release adds an incremental monthly/yearly accumulation workflow for time
+series that are delivered in many files. ``accumulate()`` splits each source
+time step at group boundaries and stores running sums and valid durations, so the
+raw data does not need to be retained. ``merge_accumulators()`` combines those
+intermediate results into final averages, flags overlapping coverage, and
+produces identical results whether the input is read as one file or many.
+
+Enhancements
+~~~~~~~~~~~~
+
+- Add ``TemporalAccessor.accumulate()`` and
+  ``TemporalAccessor.merge_accumulators()`` for incremental time averaging.
+
+
 v0.11.5 (08 October 2026)
 -------------------------
 

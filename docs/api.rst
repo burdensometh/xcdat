@@ -141,6 +141,8 @@ Methods
     Dataset.temporal.group_average
     Dataset.temporal.climatology
     Dataset.temporal.departures
+    Dataset.temporal.accumulate
+    Dataset.temporal.merge_accumulators
     Dataset.regridder.horizontal
     Dataset.regridder.vertical
 

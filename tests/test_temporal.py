@@ -5255,3 +5255,452 @@ class TestInferFreq:
         freq = _infer_freq(times)
 
         assert freq == "month"
+
+
+class TestAccumulate:
+    """Tests for the `accumulate()` intermediate accumulation API."""
+
+    @staticmethod
+    def _make_ds(
+        lower: list[str],
+        upper: list[str],
+        values: np.ndarray,
+        lat: list[int] | None = None,
+    ) -> xr.Dataset:
+        """Builds a dataset with datetime64 time bounds from bound strings."""
+        lower_arr = np.array(lower, dtype="datetime64[ns]")
+        upper_arr = np.array(upper, dtype="datetime64[ns]")
+        # Use the midpoint of the bounds as the time coordinate.
+        time_vals = (lower_arr.astype("datetime64[us]") + (
+            (upper_arr.astype("datetime64[us]") - lower_arr.astype("datetime64[us]")) // 2
+        )).astype("datetime64[ns]")
+
+        if lat is None:
+            lat = list(range(values.shape[1]))
+
+        time = xr.DataArray(
+            time_vals, dims=["time"], attrs={"axis": "T", "bounds": "time_bnds"}
+        )
+        time.encoding = {"calendar": "standard", "units": "hours since 2000-01-01"}
+        time_bnds = xr.DataArray(
+            np.stack([lower_arr, upper_arr], axis=-1),
+            dims=["time", "bnds"],
+            coords={"time": time},
+            name="time_bnds",
+        )
+        ds = xr.Dataset(coords={"time": time, "lat": lat})
+        ds["time_bnds"] = time_bnds
+        ds["tas"] = xr.DataArray(
+            values,
+            dims=["time", "lat"],
+            coords={"time": time, "lat": lat},
+            attrs={"units": "K", "test_attr": "test"},
+        )
+        return ds
+
+    def test_raises_error_if_freq_is_not_supported(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T04:00"],
+            ["2000-01-01T04:00", "2000-01-01T08:00"],
+            np.ones((2, 1)),
+        )
+
+        with pytest.raises(ValueError, match="'month' or 'year'"):
+            ds.temporal.accumulate("tas", freq="day")
+
+    def test_raises_error_if_time_bounds_are_not_ordered(self):
+        ds = self._make_ds(
+            ["2000-01-01T04:00", "2000-01-01T08:00"],
+            ["2000-01-01T00:00", "2000-01-01T12:00"],
+            np.ones((2, 1)),
+        )
+
+        with pytest.raises(ValueError, match="ordered"):
+            ds.temporal.accumulate("tas")
+
+    def test_raises_error_if_time_bounds_overlap(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T02:00", "2000-01-01T08:00"],
+            ["2000-01-01T04:00", "2000-01-01T06:00", "2000-01-01T12:00"],
+            np.ones((3, 1)),
+        )
+
+        with pytest.raises(ValueError, match="overlap"):
+            ds.temporal.accumulate("tas")
+
+    def test_splits_bounds_at_month_boundary(self):
+        # One 4-hour sample that straddles the Jan/Feb boundary:
+        # 22:00-02:00 -> 2 hours in Jan, 2 hours in Feb.
+        ds = self._make_ds(
+            ["2000-01-31T22:00"],
+            ["2000-02-01T02:00"],
+            np.array([[10.0]]),
+        )
+
+        result = ds.temporal.accumulate("tas", freq="month")
+
+        # Jan: 2 hours at 10, Feb: 2 hours at 10.
+        xr.testing.assert_allclose(
+            result.tas_sum,
+            xr.DataArray(
+                [[20.0], [20.0]],
+                dims=["time", "lat"],
+                coords={"time": result.time, "lat": result.lat},
+            ),
+        )
+        xr.testing.assert_allclose(
+            result.tas_valid_hours,
+            xr.DataArray(
+                [[2.0], [2.0]],
+                dims=["time", "lat"],
+                coords={"time": result.time, "lat": result.lat},
+            ),
+        )
+        assert result.time.values[0] == np.datetime64("2000-01-01")
+        assert result.time.values[1] == np.datetime64("2000-02-01")
+
+    def test_accumulates_sums_and_durations(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T04:00"],
+            ["2000-01-01T04:00", "2000-01-01T08:00"],
+            np.array([[1.0], [3.0]]),
+        )
+
+        result = ds.temporal.accumulate("tas")
+
+        assert result.tas_sum.values[0, 0] == pytest.approx(1.0 * 4 + 3.0 * 4)
+        assert result.tas_valid_hours.values[0, 0] == pytest.approx(8.0)
+        assert result.tas_total_hours.values[0] == pytest.approx(8.0)
+
+    def test_zero_values_count_toward_valid_duration(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T04:00"],
+            ["2000-01-01T04:00", "2000-01-01T08:00"],
+            np.array([[0.0], [4.0]]),
+        )
+
+        result = ds.temporal.accumulate("tas")
+
+        assert result.tas_valid_hours.values[0, 0] == pytest.approx(8.0)
+        # Zero contributes 0 to the sum but its duration is still valid.
+        mean = result.tas_sum.values[0, 0] / result.tas_valid_hours.values[0, 0]
+        assert mean == pytest.approx(2.0)
+
+    def test_missing_values_reduce_valid_duration_per_grid_cell_only(self):
+        # lat=0 is fully valid; lat=1 has one NaN.
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T04:00"],
+            ["2000-01-01T04:00", "2000-01-01T08:00"],
+            np.array([[1.0, 1.0], [3.0, np.nan]]),
+        )
+
+        result = ds.temporal.accumulate("tas")
+
+        assert result.tas_valid_hours.values[0, 0] == pytest.approx(8.0)
+        assert result.tas_valid_hours.values[0, 1] == pytest.approx(4.0)
+        # The covered (total) duration is independent of missing values.
+        assert result.tas_total_hours.values[0] == pytest.approx(8.0)
+
+    def test_output_has_no_source_time_values(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T04:00", "2000-02-01T00:00"],
+            ["2000-01-01T04:00", "2000-01-01T08:00", "2000-02-01T04:00"],
+            np.ones((3, 1)),
+        )
+
+        result = ds.temporal.accumulate("tas")
+
+        # One entry per month group, not one per source time step.
+        assert result.sizes["time"] == 2
+        assert "tas" not in result.data_vars
+
+
+class TestMergeAccumulators:
+    """Tests for the `merge_accumulators()` API."""
+
+    _make_ds = staticmethod(TestAccumulate._make_ds)
+
+    def test_raises_error_with_no_accumulators(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00"], ["2000-01-01T04:00"], np.ones((1, 1))
+        )
+
+        with pytest.raises(ValueError, match="At least one"):
+            ds.temporal.merge_accumulators([], "tas")
+
+    def test_raises_error_if_required_variables_are_missing(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00"], ["2000-01-01T04:00"], np.ones((1, 1))
+        )
+
+        with pytest.raises(ValueError, match="missing required variables"):
+            ds.temporal.merge_accumulators([ds], "tas")
+
+    def test_merges_accumulators_into_final_mean(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T04:00"],
+            ["2000-01-01T04:00", "2000-01-01T08:00"],
+            np.array([[1.0], [3.0]]),
+        )
+        acc = ds.temporal.accumulate("tas")
+
+        result = ds.temporal.merge_accumulators([acc], "tas")
+
+        assert result.tas.values[0, 0] == pytest.approx(2.0)
+        assert result.tas_valid_hours.values[0, 0] == pytest.approx(8.0)
+        assert "tas_sum" not in result.data_vars
+
+    def test_split_files_equal_single_file(self):
+        ds = self._make_ds(
+            [
+                "2000-01-31T18:00",
+                "2000-01-31T22:00",
+                "2000-02-01T02:00",
+                "2000-02-01T06:00",
+            ],
+            [
+                "2000-01-31T22:00",
+                "2000-02-01T02:00",
+                "2000-02-01T06:00",
+                "2000-02-01T10:00",
+            ],
+            np.array([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]]),
+        )
+
+        single = ds.temporal.accumulate("tas")
+        single_mean = single.tas_sum / single.tas_valid_hours
+
+        parts = [
+            ds.isel(time=slice(0, 1)),
+            ds.isel(time=slice(1, 3)),
+            ds.isel(time=slice(3, 4)),
+        ]
+        accs = [p.temporal.accumulate("tas") for p in parts]
+        merged = ds.temporal.merge_accumulators(accs, "tas")
+
+        xr.testing.assert_allclose(merged.tas, single_mean)
+        xr.testing.assert_allclose(merged.tas_valid_hours, single.tas_valid_hours)
+        xr.testing.assert_allclose(merged.tas_total_hours, single.tas_total_hours)
+        np.testing.assert_array_equal(merged.time.values, single.time.values)
+
+    def test_split_files_equal_single_file_for_year_freq(self):
+        ds = self._make_ds(
+            [
+                "2000-12-31T22:00",
+                "2001-01-01T02:00",
+                "2001-01-01T06:00",
+            ],
+            [
+                "2001-01-01T02:00",
+                "2001-01-01T06:00",
+                "2001-01-01T10:00",
+            ],
+            np.array([[1.0], [2.0], [3.0]]),
+        )
+
+        single = ds.temporal.accumulate("tas", freq="year")
+        accs = [
+            ds.isel(time=slice(0, 1)).temporal.accumulate("tas", freq="year"),
+            ds.isel(time=slice(1, 3)).temporal.accumulate("tas", freq="year"),
+        ]
+        merged = ds.temporal.merge_accumulators(accs, "tas")
+
+        xr.testing.assert_allclose(
+            merged.tas, single.tas_sum / single.tas_valid_hours
+        )
+        xr.testing.assert_allclose(merged.tas_valid_hours, single.tas_valid_hours)
+
+    def test_result_is_independent_of_accumulator_order(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-02-01T00:00"],
+            ["2000-01-01T04:00", "2000-02-01T04:00"],
+            np.array([[1.0], [3.0]]),
+        )
+        accs = [
+            ds.isel(time=slice(0, 1)).temporal.accumulate("tas"),
+            ds.isel(time=slice(1, 2)).temporal.accumulate("tas"),
+        ]
+
+        forward = ds.temporal.merge_accumulators(accs, "tas")
+        reverse = ds.temporal.merge_accumulators(list(reversed(accs)), "tas")
+
+        xr.testing.assert_allclose(forward.tas, reverse.tas)
+        np.testing.assert_array_equal(forward.time.values, reverse.time.values)
+
+    def test_raises_error_if_accumulators_overlap(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T04:00", "2000-01-01T08:00"],
+            ["2000-01-01T04:00", "2000-01-01T08:00", "2000-01-01T12:00"],
+            np.ones((3, 1)),
+        )
+        accs = [
+            ds.isel(time=slice(0, 2)).temporal.accumulate("tas"),
+            ds.isel(time=slice(1, 3)).temporal.accumulate("tas"),
+        ]
+
+        with pytest.raises(ValueError, match="overlapping"):
+            ds.temporal.merge_accumulators(accs, "tas")
+
+    def test_raises_error_if_duplicate_accumulator_is_merged(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00"], ["2000-01-01T04:00"], np.ones((1, 1))
+        )
+        acc = ds.temporal.accumulate("tas")
+
+        with pytest.raises(ValueError, match="overlapping"):
+            ds.temporal.merge_accumulators([acc, acc], "tas")
+
+    def test_merges_partial_months_from_different_files(self):
+        # File A covers Jan 1-2 only; file B covers Jan 3-4. Together they cover
+        # Jan 1-4. Merging should reflect the combined covered duration.
+        ds_a = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-02T00:00"],
+            ["2000-01-02T00:00", "2000-01-03T00:00"],
+            np.array([[2.0], [2.0]]),
+        )
+        ds_b = self._make_ds(
+            ["2000-01-03T00:00", "2000-01-04T00:00"],
+            ["2000-01-04T00:00", "2000-01-05T00:00"],
+            np.array([[6.0], [6.0]]),
+        )
+
+        accs = [ds_a.temporal.accumulate("tas"), ds_b.temporal.accumulate("tas")]
+        result = ds_a.temporal.merge_accumulators(accs, "tas")
+
+        # 2 days of 2.0 and 2 days of 6.0 -> weighted mean 4.0 over 96 hours.
+        assert result.tas.values[0, 0] == pytest.approx(4.0)
+        assert result.tas_total_hours.values[0] == pytest.approx(96.0)
+        assert result.tas_valid_hours.values[0, 0] == pytest.approx(96.0)
+
+    def test_merge_preserves_data_var_attrs(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00"], ["2000-01-01T04:00"], np.ones((1, 1))
+        )
+        acc = ds.temporal.accumulate("tas")
+
+        result = ds.temporal.merge_accumulators([acc], "tas")
+
+        assert result.tas.attrs["operation"] == "temporal_accumulate"
+        assert result.tas.attrs["freq"] == "month"
+        assert result.tas.attrs["merged"] == "True"
+
+    @requires_dask
+    def test_accumulate_with_dask(self):
+        ds = self._make_ds(
+            ["2000-01-01T00:00", "2000-01-01T04:00"],
+            ["2000-01-01T04:00", "2000-01-01T08:00"],
+            np.array([[1.0], [3.0]]),
+        ).chunk({"time": 1})
+
+        result = ds.temporal.accumulate("tas")
+
+        assert result.tas_sum.chunks is not None
+        assert result.tas_sum.compute().values[0, 0] == pytest.approx(16.0)
+
+    def test_cftime_values_produce_cftime_output(self):
+        dt = cftime.DatetimeNoLeap
+        lower = [dt(2000, 1, 31, 22), dt(2000, 2, 1, 2)]
+        upper = [dt(2000, 2, 1, 2), dt(2000, 2, 1, 6)]
+        time = xr.DataArray(
+            [dt(2000, 2, 1, 0), dt(2000, 2, 1, 4)],
+            dims=["time"],
+            attrs={"axis": "T", "bounds": "time_bnds"},
+        )
+        time.encoding = {"calendar": "noleap", "units": "hours since 2000-01-01"}
+        time_bnds = xr.DataArray(
+            np.array(list(zip(lower, upper)), dtype=object),
+            dims=["time", "bnds"],
+            coords={"time": time},
+            name="time_bnds",
+        )
+        ds = xr.Dataset(coords={"time": time, "lat": [0]})
+        ds["time_bnds"] = time_bnds
+        ds["tas"] = xr.DataArray(
+            np.array([[1.0], [3.0]]),
+            dims=["time", "lat"],
+            coords={"time": time, "lat": [0]},
+        )
+
+        result = ds.temporal.accumulate("tas")
+
+        assert isinstance(result.time.values[0], cftime.datetime)
+        assert result.time.values[0] == dt(2000, 1, 1)
+        assert result.time.values[1] == dt(2000, 2, 1)
+
+    def test_raises_error_if_accumulators_have_different_dimensions(self):
+        ds_a = self._make_ds(
+            ["2000-01-01T00:00"], ["2000-01-01T04:00"], np.ones((1, 1))
+        )
+        ds_b = self._make_ds(
+            ["2000-02-01T00:00"], ["2000-02-01T04:00"], np.ones((1, 1))
+        )
+        # Add an extra non-time dimension to the second accumulator.
+        acc_b = ds_b.temporal.accumulate("tas").expand_dims("extra")
+
+        accs = [ds_a.temporal.accumulate("tas"), acc_b]
+
+        with pytest.raises(ValueError, match="same data dimensions"):
+            ds_a.temporal.merge_accumulators(accs, "tas")
+
+    def test_raises_error_if_accumulators_have_different_coordinates(self):
+        ds_a = self._make_ds(
+            ["2000-01-01T00:00"], ["2000-01-01T04:00"], np.ones((1, 1)), lat=[0]
+        )
+        ds_b = self._make_ds(
+            ["2000-02-01T00:00"], ["2000-02-01T04:00"], np.ones((1, 1)), lat=[1]
+        )
+
+        accs = [ds_a.temporal.accumulate("tas"), ds_b.temporal.accumulate("tas")]
+
+        with pytest.raises(ValueError, match="same coordinates"):
+            ds_a.temporal.merge_accumulators(accs, "tas")
+
+    def test_accumulator_survives_netcdf_round_trip(self, tmp_path):
+        ds = self._make_ds(
+            ["2000-01-31T22:00", "2000-02-01T02:00"],
+            ["2000-02-01T02:00", "2000-02-01T06:00"],
+            np.array([[1.0], [3.0]]),
+        )
+        acc = ds.temporal.accumulate("tas")
+
+        path = tmp_path / "acc_a.nc"
+        acc.to_netcdf(path)
+        reloaded = xr.open_dataset(path)
+
+        result = ds.temporal.merge_accumulators([reloaded], "tas")
+        expected = ds.temporal.merge_accumulators([acc], "tas")
+
+        xr.testing.assert_allclose(result.tas, expected.tas)
+        xr.testing.assert_allclose(
+            result.tas_valid_hours, expected.tas_valid_hours
+        )
+
+    def test_raises_error_if_accumulators_have_different_calendars(self):
+        ds_a = self._make_ds(
+            ["2000-01-01T00:00"], ["2000-01-01T04:00"], np.ones((1, 1))
+        )
+
+        # Build a cftime accumulator with a different calendar.
+        dt = cftime.Datetime360Day
+        time = xr.DataArray(
+            [dt(2000, 2, 1, 2)],
+            dims=["time"],
+            attrs={"axis": "T", "bounds": "time_bnds"},
+        )
+        time.encoding = {"calendar": "360_day", "units": "hours since 2000-01-01"}
+        time_bnds = xr.DataArray(
+            np.array([[dt(2000, 2, 1, 0), dt(2000, 2, 1, 4)]], dtype=object),
+            dims=["time", "bnds"],
+            coords={"time": time},
+            name="time_bnds",
+        )
+        ds_b = xr.Dataset(coords={"time": time, "lat": [0]})
+        ds_b["time_bnds"] = time_bnds
+        ds_b["tas"] = xr.DataArray(
+            [[1.0]], dims=["time", "lat"], coords={"time": time, "lat": [0]}
+        )
+
+        accs = [ds_a.temporal.accumulate("tas"), ds_b.temporal.accumulate("tas")]
+
+        with pytest.raises(ValueError, match="same calendar"):
+            ds_a.temporal.merge_accumulators(accs, "tas")
