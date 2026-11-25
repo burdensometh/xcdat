@@ -13,6 +13,9 @@ from xcdat.utils import _if_multidim_dask_array_then_load
 
 # https://cf-xarray.readthedocs.io/en/latest/coord_axes.html#axis-names
 CFAxisKey = Literal["X", "Y", "T", "Z"]
+# Which side of the original longitude axis is authoritative when the two
+# ends of the axis map to the same meridian (the seam) after a swap.
+SeamSide = Literal["start", "end"]
 # https://cf-xarray.readthedocs.io/en/latest/coord_axes.html#coordinate-names
 CFStandardNameKey = Literal[
     "latitude", "longitude", "time", "vertical", "height", "pressure"
@@ -274,13 +277,30 @@ def center_times(dataset: xr.Dataset) -> xr.Dataset:
 
 
 def swap_lon_axis(
-    dataset: xr.Dataset, to: tuple[float, float], sort_ascending: bool = True
+    dataset: xr.Dataset,
+    to: tuple[float, float],
+    sort_ascending: bool = True,
+    seam_side: SeamSide | None = None,
 ) -> xr.Dataset:
     """Swaps the orientation of a dataset's longitude axis.
 
     This method also swaps the axis orientation of the longitude bounds if it
     exists. Afterwards, it sorts longitude and longitude bounds values in
     ascending order.
+
+    When the axis covers the full globe, its two ends represent the same
+    meridian (the seam, e.g. 0/360 or -180/180). After a swap these two grid
+    points collide on the same longitude. The collision is resolved by merging
+    the two points into a single grid point:
+
+    * If ``seam_side`` is specified, the value from that side of the original
+      axis (``"start"`` or ``"end"``) is treated as authoritative.
+    * If ``seam_side`` is None and the two values conflict (both are valid but
+      differ), a ``ValueError`` is raised. If only one side is valid (the other
+      is missing/NaN), the valid value is retained.
+
+    Bounds are merged alongside the data so the support area of the seam cell
+    is counted exactly once.
 
     Note, based on how datasets are chunked, swapping the longitude dimension
     and sorting might raise ``PerformanceWarning: Slicing is producing a
@@ -301,12 +321,33 @@ def swap_lon_axis(
     sort_ascending : bool
         After swapping, sort in ascending order (True), or keep existing order
         (False).
+    seam_side : {"start", "end"} | None, optional
+        Which side of the original (pre-swap) longitude axis is authoritative
+        for the seam cell whose two ends collide after the swap:
+
+        * "start": retain the value at the start of the original axis.
+        * "end": retain the value at the end of the original axis.
+        * None (default): retain the single valid side if one side is missing,
+          but raise a ``ValueError`` if both sides hold differing valid values.
 
     Returns
     -------
     xr.Dataset
         The Dataset with swapped lon axes orientation.
+
+    Raises
+    ------
+    ValueError
+        If the two sides of the seam hold conflicting valid values and
+        ``seam_side`` is not specified, or if ``seam_side`` is not one of
+        "start", "end", or None.
     """
+    if seam_side is not None and seam_side not in ("start", "end"):
+        raise ValueError(
+            f"Incorrect `seam_side` argument value '{seam_side}'. Supported "
+            "values include: 'start', 'end', or None."
+        )
+
     ds = dataset.copy()
     coords = get_dim_coords(ds, "X").coords
     coord_keys = list(coords.keys())
@@ -331,13 +372,415 @@ def swap_lon_axis(
         for key in bounds.data_vars.keys():
             ds = _swap_lon_bounds(ds, str(key), to)
 
+    # The two ends of a global longitude axis represent the same meridian and
+    # collide after a swap. Merge the duplicate seam points (data, masks, and
+    # bounds) so the seam cell exists exactly once.
+    ds = _dedupe_lon_seam(ds, seam_side)
+
     if sort_ascending:
         ds = ds.sortby(list(coords.dims), ascending=True)
 
     return ds
 
 
-def _get_all_coord_keys(obj: xr.Dataset | xr.DataArray, axis: CFAxisKey) -> list[str]:
+def _dedupe_lon_seam(ds: xr.Dataset, seam_side: SeamSide | None) -> xr.Dataset:
+    """Merges the duplicate grid points that collide on the longitude seam.
+
+    The two ends of a global longitude axis represent the same meridian (e.g.
+    0/360 or -180/180) and map to the same coordinate value after an axis
+    orientation swap. This function detects that collision pair for each
+    longitude dimension and merges it into a single grid point across every
+    variable, coordinate, and bounds attached to the dimension.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        The Dataset after swapping longitude orientation (not yet sorted).
+    seam_side : {"start", "end"} | None
+        Which side of the original axis is authoritative. If None, a conflict
+        between two valid values raises a ``ValueError``; a missing value on
+        one side falls back to the valid side.
+
+    Returns
+    -------
+    xr.Dataset
+        The Dataset with each longitude seam collision merged into one point.
+
+    Raises
+    ------
+    ValueError
+        If a longitude dimension has a seam collision that is not a single
+        pair, or if conflicting valid values exist and ``seam_side`` is None.
+    """
+    x_dims = get_dim_keys(ds, "X")
+    x_dims = [x_dims] if isinstance(x_dims, str) else x_dims
+
+    # Snapshot auxiliary coordinates (e.g. "bnds") so they can be restored
+    # after concatenating the merged seam point back into the dataset.
+    original_coords = ds.coords.copy()
+
+    try:
+        bounds = ds.bounds.get_bounds("X")
+    except KeyError:
+        bounds = None
+
+    if isinstance(bounds, xr.DataArray):
+        bounds_keys = [str(bounds.name)]
+    elif isinstance(bounds, xr.Dataset):
+        bounds_keys = [str(key) for key in bounds.data_vars.keys()]
+    else:
+        bounds_keys = []
+
+    for dim in x_dims:
+        # Indices are still in the original order at this stage, so the first
+        # collision index is the "start" side and the second the "end" side.
+        _, inverse, counts = np.unique(
+            ds.coords[dim].values, return_inverse=True, return_counts=True
+        )
+
+        if not np.any(counts > 1):
+            continue
+
+        collision_values = np.where(counts > 1)[0]
+        if collision_values.size != 1 or counts[collision_values[0]] != 2:
+            duplicate_lons = ds.coords[dim].values[
+                np.isin(inverse, collision_values)
+            ]
+            raise ValueError(
+                f"Expected a single pair of duplicate longitude points on the "
+                f"'{dim}' seam, but found duplicate longitude values "
+                f"{duplicate_lons.tolist()}."
+            )
+
+        start_idx, end_idx = np.where(inverse == collision_values[0])[0]
+        ds = _merge_lon_seam_pair(
+            ds,
+            original_coords,
+            x_dims,
+            dim,
+            int(start_idx),
+            int(end_idx),
+            seam_side,
+            bounds_keys,
+        )
+
+    return ds
+
+
+def _merge_lon_seam_pair(
+    ds: xr.Dataset,
+    original_coords: xr.Coordinates,
+    x_dims: list[str],
+    dim: str,
+    start_idx: int,
+    end_idx: int,
+    seam_side: SeamSide | None,
+    bounds_keys: list[str],
+) -> xr.Dataset:
+    """Merges a single duplicate seam pair on ``dim`` into one grid point.
+
+    Only variables and coordinates that use ``dim`` are modified; unrelated
+    variables (e.g. latitude bounds) are passed through untouched.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        The Dataset containing the duplicate seam pair.
+    original_coords : xr.Coordinates
+        Snapshot of the dataset coordinates before the merge, used to restore
+        auxiliary dimension coordinates (e.g. the "bnds" dimension).
+    x_dims : list[str]
+        All longitude dimension names, used to skip coordinates belonging to
+        another (not yet merged) longitude dimension.
+    dim : str
+        The longitude dimension name.
+    start_idx : int
+        Index of the point from the start side of the original axis.
+    end_idx : int
+        Index of the point from the end side of the original axis.
+    seam_side : {"start", "end"} | None
+        Authoritative side when both values are valid but differ.
+    bounds_keys : list[str]
+        Names of longitude bounds variables, which are merged by union rather
+        than value selection so the support area is counted once.
+
+    Returns
+    -------
+    xr.Dataset
+        The Dataset with the end-side duplicate point removed.
+    """
+    start_side = ds.isel({dim: start_idx})
+    end_side = ds.isel({dim: end_idx})
+
+    lon_names = [
+        str(name)
+        for name in list(ds.data_vars) + list(ds.coords)
+        if dim in ds[name].dims
+    ]
+
+    # Validate that every non-bounds variable can resolve its seam pair.
+    _validate_seam_pairs(
+        lon_names, bounds_keys, start_side, end_side, seam_side, dim
+    )
+
+    # Build the merged seam point for each variable on the axis.
+    seam_vars = _build_merged_seam_vars(
+        lon_names, bounds_keys, start_side, end_side, seam_side, dim
+    )
+
+    # Rebuild the longitude-axis variables with the single merged seam point.
+    keep_indices = [
+        i for i in range(ds.sizes[dim]) if i not in (start_idx, end_idx)
+    ]
+    position = sum(i < start_idx for i in keep_indices)
+    ds_dropped = ds.isel({dim: keep_indices})
+
+    rebuilt = {
+        name: xr.concat(
+            (
+                ds_dropped[name].isel({dim: slice(0, position)}),
+                seam_vars[name].expand_dims(dim),
+                ds_dropped[name].isel({dim: slice(position, None)}),
+            ),
+            dim=dim,
+        )
+        for name in lon_names
+    }
+
+    # Recombine rebuilt longitude variables with untouched non-longitude vars.
+    ds_no_lon = ds.get(
+        [v for v in ds.data_vars if dim not in ds[v].dims]  # type: ignore
+    )
+    ds = xr.merge((ds_no_lon, xr.Dataset(rebuilt)), compat="override")
+    ds = _restore_auxiliary_coords(ds, original_coords, x_dims, dim)
+
+    return ds
+
+
+def _validate_seam_pairs(
+    lon_names: list[str],
+    bounds_keys: list[str],
+    start_side: xr.Dataset,
+    end_side: xr.Dataset,
+    seam_side: SeamSide | None,
+    dim: str,
+) -> None:
+    """Raises if any non-bounds variable has an unresolvable seam conflict.
+
+    Parameters
+    ----------
+    lon_names : list[str]
+        Names of all variables and coordinates on the longitude dimension.
+    bounds_keys : list[str]
+        Names of longitude bounds variables, which are skipped.
+    start_side, end_side : xr.Dataset
+        Datasets reduced to the start- and end-side seam points.
+    seam_side : {"start", "end"} | None
+        Authoritative side for valid-value conflicts.
+    dim : str
+        The longitude dimension name (for error messages).
+    """
+    for name in lon_names:
+        if name in bounds_keys:
+            continue
+
+        _resolve_seam_values(
+            start_side[name],
+            end_side[name],
+            seam_side,
+            var_name=name,
+            dim=dim,
+        )
+
+
+def _build_merged_seam_vars(
+    lon_names: list[str],
+    bounds_keys: list[str],
+    start_side: xr.Dataset,
+    end_side: xr.Dataset,
+    seam_side: SeamSide | None,
+    dim: str,
+) -> dict[str, xr.DataArray]:
+    """Builds the merged seam value for each longitude-axis variable.
+
+    Parameters
+    ----------
+    lon_names : list[str]
+        Names of all variables and coordinates on the longitude dimension.
+    bounds_keys : list[str]
+        Names of longitude bounds variables, which are merged by union.
+    start_side, end_side : xr.Dataset
+        Datasets reduced to the start- and end-side seam points.
+    seam_side : {"start", "end"} | None
+        Authoritative side for valid-value conflicts.
+    dim : str
+        The longitude dimension name.
+
+    Returns
+    -------
+    dict[str, xr.DataArray]
+        Mapping of variable name to its merged seam point (with the longitude
+        dimension reduced).
+    """
+    seam_vars: dict[str, xr.DataArray] = {}
+
+    for name in lon_names:
+        if name in bounds_keys:
+            seam_vars[name] = _merge_seam_bounds(
+                start_side[name], end_side[name]
+            )
+        else:
+            seam_vars[name] = _resolve_seam_values(
+                start_side[name],
+                end_side[name],
+                seam_side,
+                var_name=name,
+                dim=dim,
+            )
+
+    return seam_vars
+
+
+def _restore_auxiliary_coords(
+    ds: xr.Dataset,
+    original_coords: xr.Coordinates,
+    x_dims: list[str],
+    dim: str,
+) -> xr.Dataset:
+    """Restores non-longitude auxiliary coordinates after rebuilding the axis.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        The rebuilt dataset.
+    original_coords : xr.Coordinates
+        Coordinates snapshot taken before the merge.
+    x_dims : list[str]
+        All longitude dimension names; coordinates on these are skipped since
+        they are handled by their own merge iteration.
+    dim : str
+        The longitude dimension being merged.
+
+    Returns
+    -------
+    xr.Dataset
+        The dataset with auxiliary dimension coordinates (e.g. "bnds")
+        restored.
+    """
+    other_x_dims = [x_dim for x_dim in x_dims if x_dim != dim]
+    non_longitude_coords = xr.Coordinates(
+        {
+            name: coord
+            for name, coord in original_coords.items()
+            if not any(x_dim in coord.dims for x_dim in other_x_dims)
+        }
+    )
+
+    return _restore_non_axis_coords(ds, non_longitude_coords, dim)
+
+
+def _resolve_seam_values(
+    start_val: xr.DataArray,
+    end_val: xr.DataArray,
+    seam_side: SeamSide | None,
+    var_name: str,
+    dim: str,
+) -> xr.DataArray:
+    """Resolves a seam value pair for a single (non-bounds) variable.
+
+    Missing values (NaN/NaT) fall back to the valid side regardless of
+    ``seam_side``. When both sides are valid but differ, ``seam_side`` decides
+    the authoritative value, otherwise a ``ValueError`` is raised.
+
+    Parameters
+    ----------
+    start_val, end_val : xr.DataArray
+        The variable values at the start- and end-side seam points, with the
+        seam dimension already reduced.
+    seam_side : {"start", "end"} | None
+        Authoritative side for valid-value conflicts.
+    var_name : str
+        Name of the variable (for error messages).
+    dim : str
+        Name of the longitude dimension (for error messages).
+
+    Returns
+    -------
+    xr.DataArray
+        The resolved seam value (same shape as the inputs minus ``dim``).
+
+    Raises
+    ------
+    ValueError
+        If both values are valid, differ, and ``seam_side`` is None.
+    """
+    start_missing = start_val.isnull()
+    end_missing = end_val.isnull()
+
+    if seam_side == "start":
+        return xr.where(start_missing, end_val, start_val, keep_attrs=True)
+    if seam_side == "end":
+        return xr.where(end_missing, start_val, end_val, keep_attrs=True)
+
+    both_valid = ~(start_missing | end_missing)
+    conflict = both_valid & (start_val != end_val)
+    # NaN != NaN is False, but equality checks above already exclude missing
+    # values through `both_valid`.
+    if bool(conflict.any()):
+        raise ValueError(
+            f"Conflicting values found on the '{dim}' seam for variable "
+            f"'{var_name}': the two ends of the longitude axis map to the "
+            "same meridian but hold different valid values. Specify "
+            "`seam_side='start'` or `seam_side='end'` to declare which side "
+            "of the original axis is authoritative."
+        )
+
+    return xr.where(start_missing, end_val, start_val, keep_attrs=True)
+
+
+def _merge_seam_bounds(
+    start_bounds: xr.DataArray,
+    end_bounds: xr.DataArray,
+) -> xr.DataArray:
+    """Merges the bounds of a duplicate seam pair into a single cell.
+
+    If the two cells abut within the axis orientation, their shared edge is
+    used directly. Otherwise the cell spans the seam (e.g. [359.5, 360] and
+    [0, 0.5] -> [359.5, 0.5]), which xCDAT represents with out-of-order bounds
+    and handles correctly when generating longitude weights. This ensures the
+    merged cell's support area is the union and is counted exactly once.
+
+    Parameters
+    ----------
+    start_bounds, end_bounds : xr.DataArray
+        The 1-D bounds variables (with a trailing bounds dimension) at the
+        start- and end-side seam points.
+
+    Returns
+    -------
+    xr.DataArray
+        The merged bounds for the single seam cell.
+    """
+    s_lo, s_hi = start_bounds.values[0], start_bounds.values[1]
+    e_lo, e_hi = end_bounds.values[0], end_bounds.values[1]
+
+    if np.isclose(s_hi, e_lo):
+        lo, hi = s_lo, e_hi
+    elif np.isclose(e_hi, s_lo):
+        lo, hi = e_lo, s_hi
+    else:
+        # The cell wraps across the seam: keep out-of-order bounds.
+        lo, hi = e_lo, s_hi
+
+    merged = start_bounds.copy()
+    merged.values = np.array([lo, hi])
+
+    return merged
+
+
+def _get_all_coord_keys(
+    obj: xr.Dataset | xr.DataArray, axis: CFAxisKey
+) -> list[str]:
     """Gets all dimension and non-dimension coordinate keys for an axis.
 
     This function uses ``cf_xarray`` to interpret CF axis and coordinate name
@@ -401,9 +844,34 @@ def _swap_lon_bounds(ds: xr.Dataset, key: str, to: tuple[float, float]):
             p_meridian_index = _get_prime_meridian_index(ds[key])
 
             if p_meridian_index is not None:
-                ds = _align_lon_to_360(ds, ds[key], p_meridian_index)
+                # A seam cell (the merged cell at the -180/180 dateline) also
+                # has out-of-order bounds, but its center is the dateline and
+                # not the prime meridian. Only genuine prime-meridian cells are
+                # split, otherwise round-trip swaps grow the grid repeatedly.
+                center = ds.coords[get_dim_keys(ds[key], "X")][
+                    p_meridian_index
+                ]
+                if not _is_on_dateline(center):
+                    ds = _align_lon_to_360(ds, ds[key], p_meridian_index)
 
     return ds
+
+
+def _is_on_dateline(lon: xr.DataArray) -> bool:
+    """Whether a longitude coordinate sits on the -180/180 dateline seam.
+
+    Parameters
+    ----------
+    lon : xr.DataArray
+        Scalar longitude value(s) in either the (-180, 180) or (0, 360)
+        orientation.
+
+    Returns
+    -------
+    bool
+        True if the longitude is equivalent to 180 degrees (i.e. -180 or 180).
+    """
+    return bool(np.all(np.isclose(np.abs(np.asarray(lon, dtype=float)), 180.0)))
 
 
 def _swap_lon_axis(coords: xr.DataArray, to: tuple[float, float]) -> xr.DataArray:
@@ -533,9 +1001,13 @@ def _align_lon_to_360(
     ds_lon[lon_bounds.name] = _align_lon_bounds_to_360(lon_bounds, p_meridian_index)
 
     # After appending the extra set of bounds, update the last coordinate from
-    # 0 to 360.
+    # 0 to 360. Only coordinates on the longitude dimension are updated;
+    # auxiliary dimension coordinates (e.g. "bnds") must be left untouched.
     new_coords = {}
     for key, coord in ds_lon.coords.items():
+        if dim not in coord.dims:
+            continue
+
         values = coord.values.copy()
         values[-1] = 360
         new_coords[key] = coord.copy(data=values)
@@ -558,7 +1030,48 @@ def _align_lon_to_360(
     ds_no_lon = ds.get([v for v in ds.data_vars if dim not in ds[v].dims])  # type: ignore
     ds_final = xr.merge((ds_no_lon, ds_lon))
 
+    # The merge only carries coordinates referenced by its variables, which
+    # can drop auxiliary dimension coordinates (e.g. the "bnds" coordinate of
+    # longitude bounds). Re-attach every non-longitude coordinate unchanged.
+    ds_final = _restore_non_axis_coords(ds_final, ds.coords, dim)
+
     return ds_final
+
+
+def _restore_non_axis_coords(
+    ds: xr.Dataset, original_coords: xr.Coordinates, axis_dim: str
+) -> xr.Dataset:
+    """Re-attaches coordinates that do not belong to ``axis_dim``.
+
+    Rebuilding a dataset with ``xr.merge`` can drop auxiliary dimension
+    coordinates (e.g. the "bnds" coordinate of longitude bounds) that are not
+    referenced as dimension coordinates by the merged variables. This restores
+    any such coordinate from the pre-merge snapshot.
+
+    Parameters
+    ----------
+    ds : xr.Dataset
+        The rebuilt dataset potentially missing auxiliary coordinates.
+    original_coords : xr.Coordinates
+        The coordinate snapshot from before the rebuild.
+    axis_dim : str
+        The dimension being rebuilt; its own coordinates are left unchanged.
+
+    Returns
+    -------
+    xr.Dataset
+        The dataset with auxiliary coordinates restored.
+    """
+    for coord_name, coord in original_coords.items():
+        if axis_dim in coord.dims:
+            continue
+
+        if coord_name not in ds.coords or not ds.coords[coord_name].identical(
+            coord
+        ):
+            ds = ds.assign_coords({coord_name: coord.copy()})
+
+    return ds
 
 
 def _align_lon_bounds_to_360(

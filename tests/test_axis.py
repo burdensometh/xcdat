@@ -1045,3 +1045,328 @@ class TestSwapLonAxis:
         )
 
         assert result.identical(expected)
+
+
+def _make_global_360_dataset(
+    seam_values: tuple[float, float] = (0.0, 360.0),
+    n: int = 361,
+    include_bounds: bool = True,
+):
+    """Builds a [0, 360] global grid whose two ends share the seam meridian."""
+    lon = np.linspace(0.0, 360.0, n)
+    data = np.arange(n, dtype=float)
+    data[0], data[-1] = seam_values
+
+    coords = {
+        "lon": xr.DataArray(
+            lon,
+            dims=["lon"],
+            attrs={"units": "degrees_east", "axis": "X", "bounds": "lon_bnds"},
+        )
+    }
+    data_vars = {
+        "ts": xr.DataArray(data, dims=["lon"], attrs={"test_attr": "test"}),
+    }
+
+    if include_bounds:
+        coords["bnds"] = xr.DataArray(np.array([0, 1]), dims=["bnds"])
+        lon_bnds = np.stack(
+            [np.clip(lon - 0.5, 0.0, 360.0), np.clip(lon + 0.5, 0.0, 360.0)],
+            axis=1,
+        )
+        data_vars["lon_bnds"] = xr.DataArray(
+            lon_bnds, dims=["lon", "bnds"], attrs={"xcdat_bounds": "True"}
+        )
+
+    return xr.Dataset(coords=coords, data_vars=data_vars)
+
+
+def _make_global_180_dataset(
+    seam_values: tuple[float, float] = (0.0, 360.0), n: int = 361
+):
+    """Builds a [-180, 180] global grid whose two ends share the dateline."""
+    lon = np.linspace(-180.0, 180.0, n)
+    data = np.arange(n, dtype=float)
+    data[0], data[-1] = seam_values
+
+    lon_bnds = np.stack(
+        [np.clip(lon - 0.5, -180.0, 180.0), np.clip(lon + 0.5, -180.0, 180.0)],
+        axis=1,
+    )
+
+    return xr.Dataset(
+        coords={
+            "lon": xr.DataArray(
+                lon,
+                dims=["lon"],
+                attrs={"units": "degrees_east", "axis": "X", "bounds": "lon_bnds"},
+            ),
+            "bnds": xr.DataArray(np.array([0, 1]), dims=["bnds"]),
+        },
+        data_vars={
+            "ts": xr.DataArray(data, dims=["lon"], attrs={"test_attr": "test"}),
+            "lon_bnds": xr.DataArray(
+                lon_bnds, dims=["lon", "bnds"], attrs={"xcdat_bounds": "True"}
+            ),
+        },
+    )
+
+
+def _add_latitude_axis(ds: xr.Dataset) -> xr.Dataset:
+    """Adds a two-point latitude axis so 2-D spatial averaging is possible."""
+    ds = ds.assign_coords(
+        lat=xr.DataArray(
+            np.array([-0.5, 0.5]),
+            dims=["lat"],
+            attrs={"axis": "Y", "bounds": "lat_bnds", "units": "degrees_north"},
+        )
+    )
+    ds["lat_bnds"] = xr.DataArray(
+        np.array([[-1.0, 0.0], [0.0, 1.0]]),
+        dims=["lat", "bnds"],
+        attrs={"xcdat_bounds": "True"},
+    )
+    ds["ts"] = xr.DataArray(np.tile(ds["ts"].values, (2, 1)), dims=["lat", "lon"])
+
+    return ds
+
+
+class TestSwapLonAxisSeamDedup:
+    def test_raises_error_with_incorrect_seam_side(self):
+        ds = _make_global_360_dataset()
+
+        with pytest.raises(ValueError):
+            swap_lon_axis(ds, to=(-180, 180), seam_side="middle")  # type: ignore
+
+    def test_raises_error_on_conflicting_seam_values_without_authority(self):
+        ds = _make_global_360_dataset(seam_values=(0.0, 360.0))
+
+        with pytest.raises(ValueError, match="Conflicting values"):
+            swap_lon_axis(ds, to=(-180, 180))
+
+    def test_retains_single_valid_value_when_other_side_is_missing(self):
+        ds = _make_global_360_dataset(seam_values=(np.nan, 360.0))
+
+        result = swap_lon_axis(ds, to=(-180, 180))
+
+        assert result.sizes["lon"] == 360
+        assert len(np.unique(result.lon.values)) == 360
+        # The collision of 0/360 lands on the 0.0 meridian in this orientation.
+        np.testing.assert_allclose(result.ts.sel(lon=0.0).values, 360.0)
+
+    def test_retains_missing_value_when_both_seam_sides_are_missing(self):
+        ds = _make_global_360_dataset(seam_values=(np.nan, np.nan))
+
+        result = swap_lon_axis(ds, to=(-180, 180))
+
+        assert result.sizes["lon"] == 360
+        assert np.isnan(result.ts.sel(lon=0.0).values)
+
+    def test_seam_side_start_retains_start_side_value(self):
+        ds = _make_global_360_dataset(seam_values=(0.0, 360.0))
+
+        result = swap_lon_axis(ds, to=(-180, 180), seam_side="start")
+
+        assert result.sizes["lon"] == 360
+        np.testing.assert_allclose(result.ts.sel(lon=0.0).values, 0.0)
+
+    def test_seam_side_end_retains_end_side_value(self):
+        ds = _make_global_360_dataset(seam_values=(0.0, 360.0))
+
+        result = swap_lon_axis(ds, to=(-180, 180), seam_side="end")
+
+        assert result.sizes["lon"] == 360
+        np.testing.assert_allclose(result.ts.sel(lon=0.0).values, 360.0)
+
+    def test_equal_seam_values_merge_without_authority(self):
+        ds = _make_global_360_dataset(seam_values=(7.0, 7.0))
+
+        result = swap_lon_axis(ds, to=(-180, 180))
+
+        assert result.sizes["lon"] == 360
+        np.testing.assert_allclose(result.ts.sel(lon=0.0).values, 7.0)
+
+    def test_dedupes_without_bounds(self):
+        ds = _make_global_360_dataset(include_bounds=False)
+
+        result = swap_lon_axis(ds, to=(-180, 180), seam_side="start")
+
+        assert result.sizes["lon"] == 360
+        assert "lon_bnds" not in result
+        np.testing.assert_allclose(result.ts.sel(lon=0.0).values, 0.0)
+
+    def test_dedupes_180_native_grid_on_swap_to_360(self):
+        ds = _make_global_180_dataset(seam_values=(0.0, 360.0))
+
+        result = swap_lon_axis(ds, to=(0, 360), seam_side="start")
+
+        # The dateline endpoints map to distinct meridians (0 and 180) on the
+        # 360 axis, so no collision occurs and the grid keeps all its points.
+        assert result.sizes["lon"] == 361
+        assert len(np.unique(result.lon.values)) == 361
+        assert "bnds" in result.coords
+        np.testing.assert_allclose(
+            result.spatial.get_weights(axis=["X"]).sum().values, 360.0
+        )
+
+    def test_merges_bounds_so_support_area_is_counted_once(self):
+        ds = _make_global_360_dataset(seam_values=(0.0, 360.0))
+
+        result = swap_lon_axis(ds, to=(-180, 180), seam_side="start")
+        weights = result.spatial.get_weights(axis=["X"])
+
+        np.testing.assert_allclose(weights.sum().values, 360.0)
+
+    def test_spatial_mean_stable_across_orientations_with_equal_seam(self):
+        ds = _add_latitude_axis(
+            _make_global_360_dataset(seam_values=(7.0, 7.0))
+        )
+
+        mean_orig = ds.spatial.average("ts")["ts"].values
+        result_180 = swap_lon_axis(ds, to=(-180, 180))
+        result_360 = swap_lon_axis(result_180, to=(0, 360))
+
+        np.testing.assert_allclose(
+            result_180.spatial.average("ts")["ts"].values, mean_orig
+        )
+        np.testing.assert_allclose(
+            result_360.spatial.average("ts")["ts"].values, mean_orig
+        )
+
+    def test_round_trip_swap_preserves_grid_identity_area_and_mean(self):
+        ds = _add_latitude_axis(
+            _make_global_360_dataset(seam_values=(0.0, 360.0))
+        )
+
+        first = swap_lon_axis(ds, to=(-180, 180), seam_side="start")
+        second = swap_lon_axis(first, to=(0, 360), seam_side="start")
+        third = swap_lon_axis(second, to=(-180, 180), seam_side="start")
+        fourth = swap_lon_axis(third, to=(0, 360), seam_side="start")
+
+        # Re-visiting an orientation reproduces it exactly. The seam cell is a
+        # single out-of-order cell on the (-180, 180) axis but two split cells
+        # on the (0, 360) axis, so each orientation keeps its own fixed size.
+        xr.testing.assert_identical(first, third)
+        xr.testing.assert_identical(second, fourth)
+        assert first.sizes["lon"] == third.sizes["lon"]
+        assert second.sizes["lon"] == fourth.sizes["lon"]
+
+        for result in (first, second, third, fourth):
+            np.testing.assert_allclose(
+                result.spatial.get_weights(axis=["X"]).sum().values, 360.0
+            )
+
+        np.testing.assert_allclose(
+            first.spatial.average("ts")["ts"].values,
+            third.spatial.average("ts")["ts"].values,
+        )
+        np.testing.assert_allclose(
+            second.spatial.average("ts")["ts"].values,
+            fourth.spatial.average("ts")["ts"].values,
+        )
+        np.testing.assert_allclose(
+            first.spatial.average("ts")["ts"].values,
+            second.spatial.average("ts")["ts"].values,
+        )
+
+    def test_round_trip_through_netcdf_write_and_reread_is_stable(self, tmp_path):
+        ds = _make_global_360_dataset(seam_values=(0.0, 360.0))
+        first = swap_lon_axis(ds, to=(-180, 180), seam_side="start")
+        second = swap_lon_axis(first, to=(0, 360), seam_side="start")
+
+        filepath = tmp_path / "seam_round_trip.nc"
+        first.to_netcdf(filepath)
+        reread = xr.open_dataset(filepath).load()
+
+        assert reread.sizes["lon"] == 360
+        reread_swapped = swap_lon_axis(reread, to=(0, 360), seam_side="start")
+        xr.testing.assert_identical(reread_swapped, second)
+
+    def test_dedup_synchronizes_mask_and_data_variable(self):
+        ds = _make_global_360_dataset(seam_values=(0.0, 360.0))
+        ds["mask"] = xr.DataArray(
+            np.tile(np.arange(361) % 2 == 0, 1), dims=["lon"]
+        )
+
+        result = swap_lon_axis(ds, to=(-180, 180), seam_side="start")
+
+        assert result.sizes["lon"] == 360
+        assert result.ts.sizes["lon"] == 360
+        assert result.mask.sizes["lon"] == 360
+        assert result.lon_bnds.sizes["lon"] == 360
+        assert result.mask.dtype == bool
+
+    def test_dedup_leaves_non_longitude_variables_untouched(self):
+        ds = _make_global_360_dataset(seam_values=(0.0, 360.0))
+        ds = ds.assign_coords(
+            lat=xr.DataArray(
+                np.array([-0.5, 0.5]),
+                dims=["lat"],
+                attrs={"axis": "Y", "bounds": "lat_bnds"},
+            )
+        )
+        ds["lat_bnds"] = xr.DataArray(
+            np.array([[-1.0, 0.0], [0.0, 1.0]]),
+            dims=["lat", "bnds"],
+            attrs={"xcdat_bounds": "True"},
+        )
+        ds["field"] = xr.DataArray(
+            np.zeros((2, 361)), dims=["lat", "lon"]
+        )
+
+        result = swap_lon_axis(ds, to=(-180, 180), seam_side="start")
+
+        assert result.lat_bnds.dims == ("lat", "bnds")
+        assert result.sizes["lat"] == 2
+        assert result.field.sizes == {"lat": 2, "lon": 360}
+
+    def test_dedup_supports_dask_backed_variables(self):
+        import dask.array as da
+
+        ds = _make_global_360_dataset(seam_values=(0.0, 360.0))
+        ds["ts"] = xr.DataArray(
+            da.from_array(np.arange(361.0), chunks=100), dims=["lon"]
+        )
+
+        result = swap_lon_axis(ds, to=(-180, 180), seam_side="end")
+
+        assert result.ts.chunks is not None
+        np.testing.assert_allclose(result.ts.sel(lon=0.0).values, 360.0)
+        np.testing.assert_allclose(
+            result.ts.values,
+            swap_lon_axis(
+                ds.load(), to=(-180, 180), seam_side="end"
+            ).ts.values,
+        )
+
+    def test_non_global_grid_is_not_deduped(self):
+        ds = xr.Dataset(
+            coords={
+                "lon": xr.DataArray(
+                    np.arange(0.0, 359.0, 1.0),
+                    dims=["lon"],
+                    attrs={"axis": "X", "units": "degrees_east"},
+                )
+            },
+            data_vars={"ts": xr.DataArray(np.arange(359.0), dims=["lon"])},
+        )
+
+        result = swap_lon_axis(ds, to=(-180, 180))
+
+        assert result.sizes["lon"] == 359
+
+    def test_raises_error_when_more_than_one_seam_pair_collides(self):
+        # Two points already sit on 0, plus the 360 endpoint also wraps to 0.
+        ds = xr.Dataset(
+            coords={
+                "lon": xr.DataArray(
+                    np.array([0.0, 0.0, 90.0, 180.0, 270.0, 360.0]),
+                    dims=["lon"],
+                    attrs={"axis": "X", "units": "degrees_east"},
+                )
+            },
+            data_vars={"ts": xr.DataArray(np.arange(6.0), dims=["lon"])},
+        )
+
+        with pytest.raises(ValueError, match="single pair of duplicate"):
+            swap_lon_axis(ds, to=(-180, 180), seam_side="start")

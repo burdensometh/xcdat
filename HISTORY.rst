@@ -2,6 +2,26 @@
 History
 =======
 
+Unreleased
+----------
+
+This release fixes duplicate longitude grid points produced when
+``swap_lon_axis()`` moves the seam (0/360 or -180/180) onto the two ends of a
+global axis. The colliding points are now merged into a single grid point
+across data variables, masks, and bounds, so the seam cell's support area is
+counted exactly once and repeated swaps no longer grow the grid.
+
+Enhancements
+~~~~~~~~~~~~
+
+- Add a ``seam_side`` argument to ``swap_lon_axis()`` declaring which end of
+  the original longitude axis (``"start"`` or ``"end"``) is authoritative for
+  the merged seam cell. Without it, a conflict between two valid seam values
+  raises a ``ValueError``, while a missing value on one side falls back to the
+  valid value. Bounds are merged so spatial averages remain stable across axis
+  orientations and dataset write/re-read cycles.
+
+
 v0.11.5 (08 October 2026)
 -------------------------
 
