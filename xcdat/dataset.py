@@ -23,6 +23,12 @@ from xcdat import bounds as bounds_accessor  # noqa: F401
 from xcdat._logger import _setup_custom_logger
 from xcdat.axis import CFAxisKey, _get_all_coord_keys, swap_lon_axis
 from xcdat.axis import center_times as center_times_func
+from xcdat.units import (
+    build_source_units_record,
+    harmonize_dataset_units,
+    merge_source_units_records,
+    validate_harmonize_units,
+)
 
 logger = _setup_custom_logger(__name__)
 
@@ -134,6 +140,7 @@ def open_mfdataset(
     lon_orient: tuple[float, float] | None = None,
     data_vars: Literal["minimal", "different", "all"] | list[str] = "minimal",
     preprocess: Callable | None = None,
+    harmonize_units: dict[str, str] | None = None,
     *,
     compat: Literal[
         "no_conflicts", "override", "equals", "identical", "broadcast_equals"
@@ -215,6 +222,23 @@ def open_mfdataset(
         If provided, call this function on each dataset prior to concatenation.
         You can find the file-name from which each dataset was loaded in
         ``ds.encoding["source"]``.
+    harmonize_units : dict[str, str] | None, optional
+        An explicit mapping of data variable key to target temperature unit
+        (e.g., ``{"tas": "K"}``). When provided, each source file's variable is
+        converted to the target unit before concatenation. Supported units are
+        Kelvin (``"K"``), degrees Celsius (``"degC"``), and degrees Fahrenheit
+        (``"degF"``), with common aliases accepted case-insensitively. The
+        conversion is opt-in: source units are read from each file's ``units``
+        attribute and never inferred, and an unrecognized or missing source unit
+        raises a ``ValueError`` naming the variable and source file. Missing
+        values are decoded using each file's own fill-value encoding before
+        conversion, so sentinel values are never transformed. This relies on
+        xarray's default ``mask_and_scale=True`` decoding; passing
+        ``mask_and_scale=False`` disables fill-value detection. The source and
+        target units are written back to the converted variable's
+        ``source_units`` and ``target_units`` attributes, and a
+        ``<var>_source_units`` dataset attribute records the original unit of
+        every source file. By default None, which performs no conversion.
     compat : {"no_conflicts", "broadcast_equals", "override", "equals", "identical"}, optional
         String indicating how to compare variables of the same name for potential
         conflicts when merging. Defaults to ``"no_conflicts"`` to preserve
@@ -274,8 +298,22 @@ def open_mfdataset(
         if os.path.isdir(paths):
             paths = _parse_dir_for_nc_glob(paths)
 
+    if harmonize_units is not None:
+        validate_harmonize_units(harmonize_units)
+
+    # Each source file's original units are collected during preprocessing so
+    # the merged result records every source (xarray otherwise keeps only the
+    # first file's variable-level attributes).
+    source_units_records: list[dict[str, str]] = []
+
     # Add internal preprocessing to user-defined preprocessing (if provided).
-    preprocess = partial(_preprocess, decode_times=decode_times, callable=preprocess)
+    preprocess = partial(
+        _preprocess,
+        decode_times=decode_times,
+        callable=preprocess,
+        harmonize_units=harmonize_units,
+        source_units_records=source_units_records,
+    )
 
     # Preserve legacy defaults for `compat` and `join` by default
     # (scoped to this call). Respect explicit parameters; they take precedence
@@ -291,6 +329,9 @@ def open_mfdataset(
         preprocess=preprocess,
         **kwargs,  # type: ignore
     )
+
+    if harmonize_units is not None:
+        ds.attrs.update(merge_source_units_records(source_units_records))
 
     ds = _postprocess_dataset(ds, data_var, center_times, add_bounds, lon_orient)
 
@@ -465,7 +506,11 @@ def _parse_dir_for_nc_glob(dir_path: str | pathlib.Path) -> str:
 
 
 def _preprocess(
-    ds: xr.Dataset, decode_times: bool | None, callable: Callable | None = None
+    ds: xr.Dataset,
+    decode_times: bool | None,
+    callable: Callable | None = None,
+    harmonize_units: dict[str, str] | None = None,
+    source_units_records: list[dict[str, str]] | None = None,
 ) -> xr.Dataset:
     """Preprocesses each dataset passed to ``open_mfdataset()``.
 
@@ -486,12 +531,26 @@ def _preprocess(
     on each dataset individually before concatenating solves the aforementioned
     issue.
 
+    If ``harmonize_units`` is provided, the listed data variables are converted
+    to their declared target units on this source dataset. Because xarray
+    decodes each file's ``_FillValue``/``missing_value`` sentinels to NaN when
+    the dataset is opened, missing values are identified in the source before
+    conversion and are never transformed.
+
     Parameters
     ----------
     ds : xr.Dataset
         The Dataset.
+    decode_times : bool | None
+        Whether to decode time coordinates.
     callable : Callable | None, optional
         A user specified optional callable function for preprocessing.
+    harmonize_units : dict[str, str] | None, optional
+        A mapping of data variable key to target temperature unit. By default
+        None.
+    source_units_records : list[dict[str, str]] | None, optional
+        A list that, when provided, is appended with the original units of each
+        source file. By default None.
 
     Returns
     -------
@@ -508,6 +567,16 @@ def _preprocess(
             ds_new = decode_time(ds_new)
         except KeyError as err:
             logger.warning(err)
+
+    if harmonize_units is not None:
+        # Record the source file's original units before converting so the
+        # merged dataset's provenance reflects every source, including files
+        # whose variables carry conflicting units.
+        if source_units_records is not None:
+            source_units_records.append(
+                build_source_units_record(ds_new, harmonize_units)
+            )
+        ds_new = harmonize_dataset_units(ds_new, harmonize_units)
 
     return ds_new
 

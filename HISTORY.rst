@@ -2,6 +2,21 @@
 History
 =======
 
+Unreleased
+----------
+
+Enhancements
+~~~~~~~~~~~~
+
+- Add an opt-in ``harmonize_units`` argument to ``open_mfdataset`` for
+  converting same-named temperature variables encoded in different units
+  (Kelvin, degrees Celsius, or degrees Fahrenheit) across source files.
+  Conversions are explicit (caller-declared target units), missing values are
+  decoded using each file's own fill-value encoding before conversion, and the
+  source and target units are written back to the result. Unrecognized source
+  units raise an error naming the variable and source file.
+
+
 v0.11.5 (08 October 2026)
 -------------------------
 

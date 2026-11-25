@@ -564,6 +564,211 @@ class TestOpenMfDataset:
 
         assert result.identical(expected)
 
+    def _write_temperature_file(self, path, months, values, units, fill):
+        times = np.array(
+            [cftime.DatetimeGregorian(2000, m, 16) for m in months], dtype=object
+        )
+        time_bnds = np.array(
+            [
+                [
+                    cftime.DatetimeGregorian(2000, m, 1),
+                    cftime.DatetimeGregorian(2000, m + 1, 1),
+                ]
+                for m in months
+            ],
+            dtype=object,
+        )
+        tas = xr.DataArray(
+            np.array(values, dtype="float64"),
+            dims="time",
+            attrs={"units": units, "_FillValue": np.float64(fill)},
+        )
+        time = xr.DataArray(
+            times,
+            dims="time",
+            attrs={
+                "axis": "T",
+                "standard_name": "time",
+                "bounds": "time_bnds",
+            },
+        )
+        ds = xr.Dataset(
+            {"tas": tas},
+            coords={"time": time},
+        )
+        ds["time_bnds"] = xr.DataArray(time_bnds, dims=("time", "bnds"))
+        ds.to_netcdf(path)
+
+    def test_harmonize_units_converts_each_source_and_preserves_missing(self):
+        # Celsius file with its own fill sentinel (-999.0) for February.
+        self._write_temperature_file(
+            self.file_path1,
+            [1, 2, 3],
+            [10.0, -999.0, 12.0],
+            "degC",
+            -999.0,
+        )
+        # Kelvin file with a *different* fill sentinel (1e20).
+        self._write_temperature_file(
+            self.file_path2,
+            [4, 5, 6],
+            [286.15, 290.15, 1e20],
+            "K",
+            1e20,
+        )
+
+        result = open_mfdataset(
+            [self.file_path1, self.file_path2],
+            harmonize_units={"tas": "K"},
+            add_bounds=None,
+        )
+
+        expected = np.array(
+            [283.15, np.nan, 285.15, 286.15, 290.15, np.nan]
+        )
+        np.testing.assert_allclose(result.tas.values, expected)
+        # Both fill sentinels were decoded to NaN before conversion.
+        assert np.isnan(result.tas.values[1])
+        assert np.isnan(result.tas.values[5])
+        # Converted variable carries target units and provenance.
+        assert result.tas.attrs["units"] == "K"
+        assert result.tas.attrs["target_units"] == "K"
+        assert result.tas.attrs["source_units"] == "degC"
+        # The dataset-level record preserves BOTH sources, so the first file's
+        # variable-level attributes cannot mask the second file's conflict.
+        assert self.file_path1 in result.attrs["tas_source_units"]
+        assert "degC" in result.attrs["tas_source_units"]
+        assert self.file_path2 in result.attrs["tas_source_units"]
+        assert " K" in result.attrs["tas_source_units"]
+
+    def test_harmonize_units_is_independent_of_file_order(self):
+        self._write_temperature_file(
+            self.file_path1, [1, 2, 3], [10.0, 11.0, 12.0], "degC", -999.0
+        )
+        self._write_temperature_file(
+            self.file_path2, [4, 5, 6], [286.15, 290.15, 295.15], "K", 1e20
+        )
+
+        forward = open_mfdataset(
+            [self.file_path1, self.file_path2],
+            harmonize_units={"tas": "K"},
+            add_bounds=None,
+        )
+        reversed_ = open_mfdataset(
+            [self.file_path2, self.file_path1],
+            harmonize_units={"tas": "K"},
+            add_bounds=None,
+        )
+
+        # Values line up by time regardless of file ordering.
+        np.testing.assert_allclose(
+            forward.tas.sortby("time").values,
+            reversed_.tas.sortby("time").values,
+        )
+        # Provenance record is order-independent.
+        assert (
+            forward.attrs["tas_source_units"]
+            == reversed_.attrs["tas_source_units"]
+        )
+
+    def test_harmonize_units_monthly_mean_matches_after_reopen(self, tmp_path):
+        self._write_temperature_file(
+            self.file_path1,
+            [1, 2, 3],
+            [10.0, -999.0, 12.0],
+            "degC",
+            -999.0,
+        )
+        self._write_temperature_file(
+            self.file_path2, [4, 5, 6], [286.15, 290.15, 295.15], "K", 1e20
+        )
+
+        def monthly_mean_for(order, tag):
+            merged = open_mfdataset(
+                order, harmonize_units={"tas": "K"}, add_bounds=None
+            )
+            out_path = f"{tmp_path}/merged_{tag}.nc"
+            merged.to_netcdf(out_path)
+            reopened = xr.open_dataset(out_path)
+            monthly = reopened.temporal.group_average(
+                "tas", freq="month", weighted=True
+            )
+            return monthly.tas.values
+
+        forward = monthly_mean_for(
+            [self.file_path1, self.file_path2], "forward"
+        )
+        reversed_ = monthly_mean_for(
+            [self.file_path2, self.file_path1], "reversed"
+        )
+
+        np.testing.assert_allclose(forward, reversed_)
+        # February was missing; its monthly average stays NaN.
+        assert np.isnan(forward[1])
+        np.testing.assert_allclose(forward[0], 283.15)
+
+    def test_harmonize_units_raises_with_location_for_unknown_source_unit(self):
+        self._write_temperature_file(
+            self.file_path1, [1, 2], [1.0, 2.0], "banana", -999.0
+        )
+
+        with pytest.raises(ValueError) as exc:
+            open_mfdataset(
+                [self.file_path1],
+                harmonize_units={"tas": "K"},
+                add_bounds=None,
+            )
+
+        message = str(exc.value)
+        assert "tas" in message
+        assert self.file_path1 in message
+        assert "banana" in message
+
+    def test_harmonize_units_raises_with_location_for_missing_source_unit(self):
+        times = np.array(
+            [cftime.DatetimeGregorian(2000, 1, 16)], dtype=object
+        )
+        tas = xr.DataArray([1.0], dims="time")
+        ds = xr.Dataset(
+            {"tas": tas},
+            coords={"time": xr.DataArray(times, dims="time")},
+        )
+        ds.to_netcdf(self.file_path1)
+
+        with pytest.raises(ValueError) as exc:
+            open_mfdataset(
+                [self.file_path1],
+                harmonize_units={"tas": "K"},
+                add_bounds=None,
+            )
+
+        message = str(exc.value)
+        assert "tas" in message
+        assert self.file_path1 in message
+
+    def test_harmonize_units_validates_target_before_opening_files(self):
+        self._write_temperature_file(
+            self.file_path1, [1, 2], [1.0, 2.0], "K", -999.0
+        )
+
+        with pytest.raises(ValueError, match="Unsupported temperature unit"):
+            open_mfdataset(
+                [self.file_path1],
+                harmonize_units={"tas": "rankine"},
+                add_bounds=None,
+            )
+
+    def test_no_harmonize_units_leaves_values_and_attributes_untouched(self):
+        self._write_temperature_file(
+            self.file_path1, [1, 2], [1.0, 2.0], "degC", -999.0
+        )
+
+        result = open_mfdataset([self.file_path1], add_bounds=None)
+
+        np.testing.assert_allclose(result.tas.values, [1.0, 2.0])
+        assert result.tas.attrs["units"] == "degC"
+        assert "tas_source_units" not in result.attrs
+
 
 class TestDecodeTime:
     @pytest.fixture(autouse=True)
