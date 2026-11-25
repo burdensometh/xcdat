@@ -102,6 +102,8 @@ Classes
     bounds.BoundsAccessor
     spatial.SpatialAccessor
     temporal.TemporalAccessor
+    heat.HeatAccessor
+    heat.HeatExposureStats
     regridder.accessor.RegridderAccessor
     regridder.regrid2.Regrid2Regridder
     regridder.xesmf.XESMFRegridder
@@ -141,6 +143,7 @@ Methods
     Dataset.temporal.group_average
     Dataset.temporal.climatology
     Dataset.temporal.departures
+    Dataset.heat.exposure
     Dataset.regridder.horizontal
     Dataset.regridder.vertical
 
