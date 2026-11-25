@@ -48,6 +48,8 @@ Below is a list of module-level API functions that are available in ``xcdat``.
     :toctree: generated/
 
     mask.pcmdi_land_sea_mask
+    matching.great_circle_distance_km
+    matching.match_stations_to_samples
 
 
 Accessors
