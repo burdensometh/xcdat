@@ -1,6 +1,6 @@
 """Module containing geospatial averaging functions."""
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 from functools import reduce
 from typing import Any, Literal, TypedDict, get_args
 
@@ -11,6 +11,7 @@ import xarray as xr
 from xcdat.axis import (
     _align_lon_bounds_to_360,
     _get_prime_meridian_index,
+    get_axis_coord,
     get_dim_coords,
     get_dim_keys,
 )
@@ -72,6 +73,7 @@ class SpatialAccessor:
         threshold: float | None = None,
         mask: xr.DataArray | None = None,
         output_mask: bool | str = False,
+        coord_keys: Mapping[SpatialAxis, str] | None = None,
         **options: Any,
     ):
         """
@@ -132,6 +134,7 @@ class SpatialAccessor:
             threshold=threshold,
             mask=mask,
             output_mask=output_mask,
+            coord_keys=coord_keys,
             **options,
         )
 
@@ -142,6 +145,7 @@ class SpatialAccessor:
         threshold: float | None = None,
         mask: xr.DataArray | None = None,
         output_mask: bool | str = False,
+        coord_keys: Mapping[SpatialAxis, str] | None = None,
         **options: Any,
     ):
         """
@@ -202,6 +206,7 @@ class SpatialAccessor:
             threshold=threshold,
             mask=mask,
             output_mask=output_mask,
+            coord_keys=coord_keys,
             **options,
         )
 
@@ -209,6 +214,7 @@ class SpatialAccessor:
         self,
         data_var: str | None = None,
         method: str = "regionmask",
+        coord_keys: Mapping[SpatialAxis, str] | None = None,
         **options: Any,
     ) -> xr.DataArray:
         """
@@ -270,7 +276,9 @@ class SpatialAccessor:
         else:
             da = self._dataset[data_var]
 
-        return generate_land_sea_mask(da, method, **options)
+        return generate_land_sea_mask(
+            da, method, coord_keys=coord_keys, **options
+        )
 
     def average(
         self,
@@ -282,6 +290,7 @@ class SpatialAccessor:
         lon_bounds: RegionAxisBounds | None = None,
         skipna: bool | None = None,
         min_weight: float | None = None,
+        coord_keys: Mapping[SpatialAxis, str] | None = None,
     ) -> xr.Dataset:
         """
         Calculates the spatial average for a rectilinear grid over an optionally
@@ -347,6 +356,13 @@ class SpatialAccessor:
                   even if coverage is minimal).
                 - 1 means full data coverage is required (no missing data is
                   allowed).
+        coord_keys : Mapping[SpatialAxis, str] | None, optional
+            Explicit axis-to-coordinate mapping for disambiguating merged
+            multi-grid datasets, e.g. ``{"X": "olon", "Y": "olat"}``. Use
+            this when the data variable has more than one coordinate mapped
+            to the same axis (an ``AmbiguousAxisError`` is raised otherwise).
+            Selection applies to this call only and does not change how any
+            other variable is resolved. By default None.
 
         Returns
         -------
@@ -407,7 +423,7 @@ class SpatialAccessor:
         ds = self._dataset.copy()
         dv = _get_data_var(ds, data_var)
 
-        self._validate_axis_arg(axis)
+        self._validate_axis_arg(axis, dv, coord_keys)
         min_weight = _validate_min_weight(min_weight)
 
         if isinstance(weights, str) and weights == "generate":
@@ -415,7 +431,9 @@ class SpatialAccessor:
                 self._validate_region_bounds("Y", lat_bounds)
             if lon_bounds is not None:
                 self._validate_region_bounds("X", lon_bounds)
-            self._weights = self.get_weights(axis, lat_bounds, lon_bounds, data_var)
+            self._weights = self.get_weights(
+                axis, lat_bounds, lon_bounds, data_var, coord_keys=coord_keys
+            )
         elif isinstance(weights, xr.DataArray):
             self._weights = weights
 
@@ -433,6 +451,7 @@ class SpatialAccessor:
         lat_bounds: RegionAxisBounds | None = None,
         lon_bounds: RegionAxisBounds | None = None,
         data_var: str | None = None,
+        coord_keys: Mapping[SpatialAxis, str] | None = None,
     ) -> xr.DataArray:
         """
         Get area weights for specified axis keys and an optional target domain.
@@ -462,6 +481,11 @@ class SpatialAccessor:
             when the dataset has more than one bounds per axis (e.g., "lon"
             and "zlon_bnds" for the "X" axis), or you want weights for a
             specific data variable.
+        coord_keys : Mapping[SpatialAxis, str] | None, optional
+            Explicit axis-to-coordinate mapping for disambiguating merged
+            multi-grid datasets, e.g. ``{"X": "olon", "Y": "olat"}``. Only
+            used when ``data_var`` is provided. Selection applies to this
+            call only. By default None.
 
         Returns
         -------
@@ -498,7 +522,20 @@ class SpatialAccessor:
 
         axis_weights: AxisWeights = {}
         for key in axis:
-            d_bounds = self._dataset.bounds.get_bounds(axis=key, var_key=data_var)
+            if data_var is not None:
+                # Resolve the coordinate on this specific variable first, so
+                # merged multi-grid datasets never borrow another variable's
+                # bounds (including same-length grids with shared dim names).
+                coord = get_axis_coord(
+                    self._dataset[data_var],
+                    key,
+                    coord_key=(coord_keys or {}).get(key),
+                )
+                d_bounds = self._dataset.bounds.get_bounds(
+                    axis=key, coord_key=str(coord.name)
+                )
+            else:
+                d_bounds = self._dataset.bounds.get_bounds(axis=key)
 
             if isinstance(d_bounds, xr.Dataset):
                 raise TypeError(
@@ -518,14 +555,25 @@ class SpatialAccessor:
 
         return weights
 
-    def _validate_axis_arg(self, axis: list[SpatialAxis] | tuple[SpatialAxis, ...]):
+    def _validate_axis_arg(
+        self,
+        axis: list[SpatialAxis] | tuple[SpatialAxis, ...],
+        data_var: xr.DataArray | None = None,
+        coord_keys: Mapping[SpatialAxis, str] | None = None,
+    ):
         """
-        Validates that the ``axis`` dimension(s) exists in the dataset.
+        Validates that the ``axis`` dimension(s) exists on the data variable.
 
         Parameters
         ----------
         axis : list[SpatialAxis] | tuple[SpatialAxis, ...]
             List of axis dimensions to average over.
+        data_var : xr.DataArray | None
+            The data variable being averaged. When provided, coordinates are
+            resolved on the variable itself so ambiguous same-length grids
+            raise ``AmbiguousAxisError`` instead of being mixed silently.
+        coord_keys : Mapping[SpatialAxis, str] | None
+            Optional explicit axis-to-coordinate mapping for this call.
 
         Raises
         ------
@@ -542,8 +590,11 @@ class SpatialAccessor:
                     f"{', '.join(SPATIAL_AXES)}."
                 )
 
-            # Check the axis coordinate variable exists in the Dataset.
-            get_dim_coords(self._dataset, key)
+            if data_var is not None:
+                get_axis_coord(data_var, key, coord_key=(coord_keys or {}).get(key))
+            else:
+                # Check the axis coordinate variable exists in the Dataset.
+                get_dim_coords(self._dataset, key)
 
     def _validate_region_bounds(self, axis: SpatialAxis, bounds: RegionAxisBounds):
         """Validates the ``bounds`` arg based on a set of threshold.

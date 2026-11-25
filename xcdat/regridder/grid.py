@@ -569,11 +569,22 @@ def create_mask(ds: xr.Dataset, dims: list[CFAxisKey] | None = None) -> xr.DataA
 
     dims = list(dims)
 
-    mask_shape = {ds.cf[x].name: ds.cf[x].shape[0] for x in dims if x in ds.cf.axes}
+    # Map each requested axis to the *dimension name* and size of its
+    # coordinate. The coordinate name and dimension name differ for
+    # non-index auxiliary coordinates in merged multi-grid datasets.
+    axis_dims: set[str] = set()
+    for axis in dims:
+        if axis not in ds.cf.axes:
+            continue
+        axis_dims.update(ds.cf[axis].dims)
+
+    # Preserve the dataset's dimension ordering for backwards compatibility.
+    mask_dims = [dim for dim in ds.dims if dim in axis_dims]
+    mask_sizes = [ds.sizes[dim] for dim in mask_dims]
 
     return xr.DataArray(
-        np.ones(list(mask_shape.values())),
-        dims=[x for x in ds.dims if x in mask_shape],
+        np.ones(mask_sizes),
+        dims=mask_dims,
         name="mask",
     )
 

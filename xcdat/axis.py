@@ -172,6 +172,212 @@ def get_dim_coords(
     return dim_coords
 
 
+class AmbiguousAxisError(ValueError):
+    """Raised when more than one coordinate on a data variable fits an axis.
+
+    This occurs in merged datasets that contain multiple grids of the same
+    length (e.g., ocean and land variables sharing dimension names). Picking
+    one coordinate silently would mix one variable's data with another
+    variable's coordinates, bounds, or mask. The caller must disambiguate by
+    passing the coordinate name explicitly (for the current call only).
+    """
+
+
+def get_axis_coord(
+    da: xr.DataArray,
+    axis: CFAxisKey,
+    coord_key: str | None = None,
+    multidim: bool = False,
+) -> xr.DataArray:
+    """Get the single coordinate on ``da`` that represents ``axis``.
+
+    Unlike :func:`get_dim_coords`, this function is *variable-aware*: it only
+    considers coordinates whose dimensions are actually used by ``da`` and,
+    when several coordinates on ``da`` map to the same axis (e.g., an ocean
+    grid stored as auxiliary coordinates next to a land grid on the same
+    dimension names), it reports the conflict instead of silently picking
+    one. This keeps each variable tied to its own coordinates, bounds, and
+    mask in merged multi-grid datasets.
+
+    Parameters
+    ----------
+    da : xr.DataArray
+        The data variable to resolve the coordinate for.
+    axis : CFAxisKey
+        The CF axis key ("X", "Y", "T", or "Z").
+    coord_key : str | None, optional
+        An explicit coordinate name to use. This overrides automatic
+        selection for the current call only; it is validated against the
+        variable's dimensions and axis metadata. By default None.
+    multidim : bool, optional
+        If True, also consider non-index (including multidimensional)
+        coordinates. Scalar coordinates are excluded. Defaults to False.
+
+    Returns
+    -------
+    xr.DataArray
+        The coordinate variable representing ``axis`` on ``da``.
+
+    Raises
+    ------
+    AmbiguousAxisError
+        If multiple coordinates on ``da`` map to ``axis`` and no explicit
+        ``coord_key`` is provided.
+    KeyError
+        If no coordinate representing ``axis`` exists on ``da``, or if
+        ``coord_key`` is not a coordinate on ``da``.
+    ValueError
+        If ``coord_key`` does not share a dimension with ``da`` or does not
+        map to ``axis``.
+    """
+    if coord_key is not None:
+        return _validate_explicit_axis_coord(da, axis, coord_key, multidim)
+
+    candidate_keys = _get_axis_coord_keys(da, axis, multidim=multidim)
+
+    if len(candidate_keys) == 0:
+        raise KeyError(
+            f"No '{axis}' axis coordinate variables were found on the data "
+            f"variable '{da.name}'. Make sure a coordinate variable exists, "
+            "its dimensions are shared with the data variable, and its CF "
+            "'axis' or 'standard_name' attrs are correctly set."
+        )
+
+    # On curvilinear grids the same physical axis is described by a 1-D grid
+    # index (e.g., "nlon") and a physical geographic coordinate (e.g., "lon").
+    # The physical coordinate is the unambiguous choice; only same-rank
+    # candidates (e.g., two 1-D same-length grids merged into one file)
+    # represent a real conflict.
+    preferred = _prefer_physical_axis_coords(da, candidate_keys, axis)
+
+    if len(preferred) > 1:
+        example = f"coord_keys={{{axis!r}: {preferred[0]!r}}}"
+        raise AmbiguousAxisError(
+            f"The data variable '{da.name}' has more than one coordinate "
+            f"mapped to the '{axis}' axis: {preferred}. This usually "
+            "means the dataset merges multiple grids (e.g., ocean and land "
+            "variables) that share dimension names or have the same length. "
+            "Picking one automatically risks combining the variable with the "
+            "wrong coordinates, bounds, or mask. Pass the coordinate name "
+            f"explicitly for this call, e.g. {example}."
+        )
+
+    return da[preferred[0]].copy()
+
+
+def _prefer_physical_axis_coords(
+    da: xr.DataArray, candidate_keys: list[str], axis: CFAxisKey
+) -> list[str]:
+    """Prefer CF physical coordinates over grid-index coordinates.
+
+    When candidates have different dimensionality (e.g., a 2-D physical
+    latitude on a curvilinear grid versus its 1-D grid index), keep only the
+    physical (geographic) coordinates. Same-rank candidates are all returned
+    so genuine same-length multi-grid conflicts stay detectable.
+    """
+    if axis not in ("X", "Y") or len(candidate_keys) <= 1:
+        return sorted(candidate_keys)
+
+    physical_names = set(VAR_NAME_MAP[axis])
+    physical_keys = [
+        name
+        for name in candidate_keys
+        if name in physical_names
+        or da.coords[name].attrs.get("standard_name")
+        == CF_ATTR_MAP[axis]["coordinate"]
+    ]
+
+    ranks = {da.coords[name].ndim for name in candidate_keys}
+    if physical_keys and len(ranks) > 1:
+        return sorted(physical_keys)
+
+    return sorted(candidate_keys)
+
+
+def _validate_explicit_axis_coord(
+    da: xr.DataArray, axis: CFAxisKey, coord_key: str, multidim: bool
+) -> xr.DataArray:
+    """Validate and return an explicitly selected axis coordinate."""
+    if coord_key not in da.coords:
+        raise KeyError(
+            f"The explicit coordinate '{coord_key}' is not a coordinate on "
+            f"the data variable '{da.name}'. Available coordinates: "
+            f"{sorted(str(c) for c in da.coords)}."
+        )
+
+    coord = da.coords[coord_key]
+
+    if not set(coord.dims) & set(da.dims):
+        raise ValueError(
+            f"The explicit coordinate '{coord_key}' does not share a "
+            f"dimension with the data variable '{da.name}' "
+            f"(coord dims: {coord.dims}, var dims: {da.dims})."
+        )
+
+    valid_keys = set(_get_all_coord_keys(da, axis))
+    if coord_key not in valid_keys:
+        raise ValueError(
+            f"The explicit coordinate '{coord_key}' is not mapped to the "
+            f"'{axis}' axis. Set its CF 'axis' or 'standard_name' attribute "
+            "or choose a coordinate mapped to that axis."
+        )
+
+    if coord.ndim == 0 and not multidim:
+        raise ValueError(
+            f"The explicit coordinate '{coord_key}' is scalar and cannot "
+            f"represent the '{axis}' axis."
+        )
+
+    return coord.copy()
+
+
+def _get_axis_coord_keys(
+    da: xr.DataArray, axis: CFAxisKey, multidim: bool
+) -> list[str]:
+    """Return axis coordinate keys that belong to ``da``, preference-ordered.
+
+    When the data variable carries a CF ``coordinates`` attribute that names
+    axis-mapped coordinates, only those referenced coordinates are returned:
+    the attribute is the variable's explicit declaration of its own grid and
+    is the strongest per-variable signal in merged multi-grid datasets.
+    """
+    all_keys = set(_get_all_coord_keys(da, axis))
+
+    if multidim:
+        candidate_keys = {name for name in all_keys if da.coords[name].ndim > 0}
+    else:
+        candidate_keys = {name for name in all_keys if name in da.indexes}
+
+        # Non-index 1-D auxiliary coordinates (e.g., an ocean grid stored next
+        # to a land grid on the same dimension names) are valid on a
+        # rectilinear grid and must participate in ambiguity detection.
+        candidate_keys |= {
+            name
+            for name in all_keys
+            if da.coords[name].ndim == 1 and set(da.coords[name].dims) <= set(da.dims)
+        }
+
+    # The CF "coordinates" attribute explicitly names the coordinates that
+    # describe the variable. If it references any coordinate mapped to this
+    # axis, restrict the candidates to those references.
+    referenced = _get_coordinates_attr_keys(da) & candidate_keys
+
+    if referenced:
+        return sorted(referenced)
+
+    return sorted(candidate_keys)
+
+
+def _get_coordinates_attr_keys(da: xr.DataArray) -> set[str]:
+    """Parse the CF ``coordinates`` attribute of a data variable."""
+    raw = da.attrs.get("coordinates")
+
+    if not isinstance(raw, str) or not raw.strip():
+        return set()
+
+    return {name for name in raw.split() if name in da.coords}
+
+
 def get_coords_by_name(obj: xr.Dataset | xr.DataArray, axis: CFAxisKey) -> xr.DataArray:
     """Retrieve the coordinate variable based on its name.
 

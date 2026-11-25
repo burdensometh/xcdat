@@ -1,3 +1,4 @@
+from collections.abc import Mapping
 from typing import Any, Callable
 
 import numpy as np
@@ -7,7 +8,7 @@ import xarray as xr
 from xcdat import open_dataset
 from xcdat._data import _get_pcmdi_mask_path
 from xcdat._logger import _setup_custom_logger
-from xcdat.axis import get_dim_coords
+from xcdat.axis import CFAxisKey, get_axis_coord
 from xcdat.regridder.accessor import _obj_to_grid_ds
 from xcdat.regridder.grid import create_grid
 from xcdat.utils import _as_dataarray
@@ -26,6 +27,7 @@ def generate_and_apply_land_sea_mask(
     threshold: float | None = None,
     mask: xr.DataArray | None = None,
     output_mask: bool | str = False,
+    coord_keys: Mapping[CFAxisKey, str] | None = None,
     **options: Any,
 ) -> xr.Dataset:
     """Generate a land-sea mask and apply it to a data variable in a dataset.
@@ -50,6 +52,11 @@ def generate_and_apply_land_sea_mask(
     mask : xr.DataArray | None, optional
         A custom mask to apply, by default None. If None, a mask is
         generated using the specified ``method``.
+    coord_keys : Mapping[CFAxisKey, str] | None, optional
+        Explicit axis-to-coordinate mapping for disambiguating merged
+        multi-grid datasets, e.g. ``{"X": "olon", "Y": "olat"}``. The mask
+        is generated on the selected variable's own grid. Selection applies
+        to this call only. By default None.
     **options : Any
         These options are passed directly to the ``method``. See
         :func:`xcdat.mask.pcmdi_land_sea_mask` for PCMDI options.
@@ -90,7 +97,7 @@ def generate_and_apply_land_sea_mask(
     da = _ds[data_var]
 
     if mask is None:
-        mask = generate_land_sea_mask(da, method, **options)
+        mask = generate_land_sea_mask(da, method, coord_keys=coord_keys, **options)
 
     if keep == "sea":
         _ds[data_var] = da.where(mask <= (threshold or 0.2))
@@ -109,7 +116,10 @@ def generate_and_apply_land_sea_mask(
 
 
 def generate_land_sea_mask(
-    da: xr.DataArray, method: str = "regionmask", **options: Any
+    da: xr.DataArray,
+    method: str = "regionmask",
+    coord_keys: Mapping[CFAxisKey, str] | None = None,
+    **options: Any,
 ) -> xr.DataArray:
     """Generate a land-sea mask.
 
@@ -120,6 +130,11 @@ def generate_land_sea_mask(
     method : str, optional
         The method to use for generating the mask, by default "regionmask".
         Supported methods: "regionmask", "pcmdi".
+    coord_keys : Mapping[CFAxisKey, str] | None, optional
+        Explicit axis-to-coordinate mapping for disambiguating merged
+        multi-grid datasets. The mask is generated using the selected
+        variable's own coordinates. Selection applies to this call only. By
+        default None.
     **options : Any
         These options are passed directly to the ``method``. See specific
         method documentation for available options:
@@ -167,13 +182,16 @@ def generate_land_sea_mask(
     if method == "regionmask":
         land_mask = regionmask.defined_regions.natural_earth_v5_0_0.land_110
 
-        lon, lat = get_dim_coords(da, "X"), get_dim_coords(da, "Y")
+        lon = get_axis_coord(da, "X", coord_key=(coord_keys or {}).get("X"))
+        lat = get_axis_coord(da, "Y", coord_key=(coord_keys or {}).get("Y"))
 
         land_sea_mask = land_mask.mask(lon, lat=lat)
 
         land_sea_mask = xr.where(land_sea_mask, 0, 1)
     elif method == "pcmdi":
-        land_sea_mask = pcmdi_land_sea_mask(da, **options)
+        land_sea_mask = pcmdi_land_sea_mask(
+            da, coord_keys=coord_keys, **options
+        )
 
     return land_sea_mask
 
@@ -184,6 +202,7 @@ def pcmdi_land_sea_mask(
     threshold2: float = 0.3,
     source: xr.Dataset | None = None,
     source_data_var: str | None = None,
+    coord_keys: Mapping[CFAxisKey, str] | None = None,
 ) -> xr.DataArray:
     """
     Generate a land-sea mask using the PCMDI method.
@@ -206,6 +225,10 @@ def pcmdi_land_sea_mask(
     source_data_var : str | None, optional
         The name of the variable in `source` to use as the high-resolution
         source. If `source` is not provided, this defaults to "sftlf".
+    coord_keys : Mapping[CFAxisKey, str] | None, optional
+        Explicit axis-to-coordinate mapping for disambiguating merged
+        multi-grid datasets. Selection applies to this call only. By
+        default None.
 
     Returns
     -------
@@ -276,7 +299,9 @@ def pcmdi_land_sea_mask(
         source = open_dataset(resource_path, decode_times=False)
 
     source_regrid = source.regridder.horizontal(
-        source_data_var, _obj_to_grid_ds(da), tool="regrid2"
+        source_data_var,
+        _obj_to_grid_ds(da, coord_keys=coord_keys),
+        tool="regrid2",
     )
 
     mask = source_regrid.copy()

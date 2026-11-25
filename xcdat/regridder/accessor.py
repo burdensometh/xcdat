@@ -1,12 +1,16 @@
+from collections.abc import Mapping
 from typing import Any, Literal
 
 import xarray as xr
 
-from xcdat.axis import CFAxisKey, get_coords_by_name, get_dim_coords
+from xcdat.axis import CFAxisKey, get_axis_coord, get_coords_by_name, get_dim_coords
 from xcdat.bounds import create_bounds
 from xcdat.regridder import regrid2, xesmf, xgcm
 from xcdat.regridder.base import BaseRegridder
 from xcdat.regridder.grid import _validate_grid_has_single_axis_dim
+
+#: Type alias for explicit per-call axis-to-coordinate selections.
+CoordKeys = Mapping[CFAxisKey, str]
 
 HorizontalRegridTools = Literal["xesmf", "regrid2"]
 HORIZONTAL_REGRID_TOOLS: dict[str, type[BaseRegridder]] = {
@@ -88,6 +92,7 @@ class RegridderAccessor:
         data_var: str,
         output_grid: xr.Dataset,
         tool: HorizontalRegridTools = "xesmf",
+        coord_keys: CoordKeys | None = None,
         **options: Any,
     ) -> xr.Dataset:
         """
@@ -119,6 +124,13 @@ class RegridderAccessor:
             Grid to transform ``data_var`` to.
         tool : str
             Name of the tool to use.
+        coord_keys : CoordKeys | None, optional
+            Explicit axis-to-coordinate mapping for disambiguating merged
+            multi-grid datasets, e.g. ``{"X": "olon", "Y": "olat"}``. The
+            source grid (coordinates, bounds, and mask) is then built from
+            those coordinates only. Selection applies to this call only and
+            does not affect how any other data variable is resolved. By
+            default None.
         **options : Any
             These options are passed directly to the ``tool``. See specific
             regridder for available options.
@@ -168,7 +180,11 @@ class RegridderAccessor:
             ) from e
 
         input_grid = _get_input_grid(
-            self._ds, data_var, ["X", "Y"], multidim=regrid_tool.can_handle_multidim()
+            self._ds,
+            data_var,
+            ["X", "Y"],
+            multidim=regrid_tool.can_handle_multidim(),
+            coord_keys=coord_keys,
         )
         regridder = regrid_tool(input_grid, output_grid, **options)
         output_ds = regridder.horizontal(data_var, self._ds)
@@ -180,6 +196,7 @@ class RegridderAccessor:
         data_var: str,
         output_grid: xr.Dataset,
         tool: VerticalRegridTools = "xgcm",
+        coord_keys: CoordKeys | None = None,
         **options: Any,
     ) -> xr.Dataset:
         """
@@ -199,6 +216,10 @@ class RegridderAccessor:
             Grid to transform ``data_var`` to.
         tool : str
             Name of the tool to use.
+        coord_keys : CoordKeys | None, optional
+            Explicit axis-to-coordinate mapping for disambiguating merged
+            multi-grid datasets. Selection applies to this call only. By
+            default None.
         **options : Any
             These options are passed directly to the ``tool``. See specific
             regridder for available options.
@@ -240,7 +261,9 @@ class RegridderAccessor:
                 f"{list(VERTICAL_REGRID_TOOLS)}"
             ) from e
 
-        input_grid = _get_input_grid(self._ds, data_var, ["Z"])
+        input_grid = _get_input_grid(
+            self._ds, data_var, ["Z"], coord_keys=coord_keys
+        )
         regridder = regrid_tool(input_grid, output_grid, **options)
         output_ds = regridder.vertical(data_var, self._ds)
 
@@ -248,7 +271,10 @@ class RegridderAccessor:
 
 
 def _obj_to_grid_ds(
-    obj: xr.Dataset | xr.DataArray, multidim: bool = False
+    obj: xr.Dataset | xr.DataArray,
+    multidim: bool = False,
+    coord_keys: Mapping[CFAxisKey, str] | None = None,
+    target_var: str | None = None,
 ) -> xr.Dataset:
     """
     Convert an xarray object to a new Dataset containing axis coordinates and
@@ -259,10 +285,24 @@ def _obj_to_grid_ds(
     Dataset. If bounds are missing for an axis, they are added to the
     output Dataset.
 
+    When ``obj`` is a ``xr.DataArray`` or ``coord_keys`` is supplied, the
+    variable-aware resolver (:func:`xcdat.axis.get_axis_coord`) is used so
+    that merged multi-grid datasets never borrow another variable's
+    coordinates or bounds. ``target_var`` pins resolution to a specific
+    data variable while other axes (e.g., "Z") on the source Dataset are
+    still retained.
+
     Parameters
     ----------
     obj : xr.Dataset or xr.DataArray
         The input xarray object containing the data and attributes.
+    multidim : bool, optional
+        Whether multidimensional coordinates are allowed.
+    coord_keys : Mapping[CFAxisKey, str] | None, optional
+        Explicit axis-to-coordinate mapping for this call.
+    target_var : str | None, optional
+        The data variable whose grid should be resolved when ``obj`` is a
+        Dataset with multiple variables.
 
     Returns
     -------
@@ -286,7 +326,25 @@ def _obj_to_grid_ds(
 
     with xr.set_options(keep_attrs=True):
         for axis in axis_names:
-            coord, bounds = _get_axis_coord_and_bounds(obj, axis, multidim=multidim)
+            if isinstance(obj, xr.DataArray) or coord_keys is not None:
+                coord, bounds = _get_resolved_axis_coord_and_bounds(
+                    obj,
+                    axis,
+                    multidim=multidim,
+                    coord_key=(coord_keys or {}).get(axis),
+                    target_var=target_var,
+                )
+                # Axes absent from the target variable (e.g., a "Z" axis on
+                # a 2-D variable) are still part of the source grid and were
+                # historically extracted at the dataset level.
+                if coord is None and isinstance(obj, xr.Dataset):
+                    coord, bounds = _get_axis_coord_and_bounds(
+                        obj, axis, multidim=multidim
+                    )
+            else:
+                coord, bounds = _get_axis_coord_and_bounds(
+                    obj, axis, multidim=multidim
+                )
 
             if coord is not None:
                 axis_coords[str(coord.name)] = coord
@@ -320,6 +378,70 @@ def _obj_to_grid_ds(
             output_ds = output_ds.bounds.add_bounds(axis=axis)
 
     return output_ds
+
+
+def _get_resolved_axis_coord_and_bounds(
+    obj: xr.Dataset | xr.DataArray,
+    axis: CFAxisKey,
+    multidim: bool = False,
+    coord_key: str | None = None,
+    target_var: str | None = None,
+) -> tuple[xr.DataArray | None, xr.DataArray | None]:
+    """Resolve one axis coordinate (and its bounds) on a specific variable.
+
+    Coordinates are resolved on the target data variable, while bounds are
+    looked up on the parent Dataset because bounds are stored as dataset-level
+    data variables rather than DataArray coordinates.
+    """
+    if isinstance(obj, xr.DataArray):
+        da = obj
+        bounds_source: xr.Dataset | xr.DataArray = obj
+    else:
+        da = obj[target_var] if target_var is not None else _single_var(obj)
+        bounds_source = obj
+
+    try:
+        coord_var = get_axis_coord(
+            da, axis, coord_key=coord_key, multidim=multidim
+        )
+    except KeyError:
+        return None, None
+    if not multidim:
+        _validate_grid_has_single_axis_dim(axis, coord_var)
+
+    if coord_var.size == 1:
+        raise ValueError(
+            f"Coordinate '{coord_var.name}' is a singleton and cannot be used."
+        )
+
+    bounds_var = None
+    bounds_key = coord_var.attrs.get("bounds")
+    if bounds_key:
+        if isinstance(bounds_source, xr.Dataset):
+            bounds_var = bounds_source.data_vars.get(bounds_key)
+            if bounds_var is None:
+                bounds_var = bounds_source.coords.get(bounds_key)
+        else:
+            bounds_var = bounds_source.coords.get(bounds_key)
+        # Only 1-D coordinates support bounds generation; 2-D curvilinear
+        # coordinates must provide their own bounds.
+        if bounds_var is None and coord_var.ndim == 1:
+            bounds_var = create_bounds(axis, coord_var)
+
+    return coord_var, bounds_var
+
+
+def _single_var(ds: xr.Dataset) -> xr.DataArray:
+    """Return the single non-bounds data variable of a small grid dataset."""
+    non_bounds = [name for name in ds.data_vars if name not in ds.bounds.keys]
+
+    if len(non_bounds) != 1:
+        raise ValueError(
+            f"Expected a single data variable to resolve grid coordinates, "
+            f"found {non_bounds}."
+        )
+
+    return ds[non_bounds[0]]
 
 
 def _get_axis_coord_and_bounds(
@@ -357,13 +479,17 @@ def _get_input_grid(
     data_var: str,
     dup_check_dims: list[CFAxisKey],
     multidim: bool = False,
+    coord_keys: Mapping[CFAxisKey, str] | None = None,
 ):
     """
-    Extract the grid from ``ds``.
+    Extract the grid for ``data_var`` from ``ds``.
 
-    This function will remove any duplicate dimensions leaving only dimensions
-    used by the ``data_var``. All extraneous dimensions and variables are
-    dropped, returning only the grid.
+    The grid is built from the coordinates resolved on the data variable
+    itself (via :func:`xcdat.axis.get_axis_coord`), along with each
+    coordinate's own bounds. Coordinate variables that map to the same axis
+    but belong to a different grid (e.g., "lon" vs "olon" on same-length
+    dimensions) are dropped instead of being silently mixed in. Any "mask"
+    variable is only kept when its dimensions match the resolved grid.
 
     Parameters
     ----------
@@ -372,37 +498,99 @@ def _get_input_grid(
     data_var : str
         Name of target data variable.
     dup_check_dims : list[CFAxisKey]
-        List of dimensions to check for duplicates.
+        List of axes to resolve.
+    multidim : bool, optional
+        Whether multidimensional coordinates are allowed.
+    coord_keys : Mapping[CFAxisKey, str] | None, optional
+        Explicit axis-to-coordinate mapping for this call only.
 
     Returns
     -------
     xr.Dataset
         Dataset containing grid dataset.
     """
-    to_drop = []
+    da = ds[data_var]
 
-    all_coords = set(ds.coords.keys())
+    resolved: dict[CFAxisKey, xr.DataArray] = {}
+    for axis in dup_check_dims:
+        resolved[axis] = get_axis_coord(
+            da, axis, coord_key=(coord_keys or {}).get(axis), multidim=multidim
+        )
+    resolved_names = {str(coord.name) for coord in resolved.values()}
+    resolved_keymap = {axis: str(coord.name) for axis, coord in resolved.items()}
+    resolved_dims: set[str] = set()
+    for coord in resolved.values():
+        resolved_dims.update(coord.dims)
+    resolved_ranks = {coord.ndim for coord in resolved.values()}
 
-    for dimension in dup_check_dims:
-        coords = get_dim_coords(ds, dimension, multidim=multidim)
+    # Other coordinate variables mapped to the same axes belong to a
+    # different grid (e.g., an auxiliary ocean grid on shared dim names).
+    # Index coordinates of a different rank (e.g., 1-D "nlat"/"nlon"
+    # indexes backing 2-D curvilinear "lat"/"lon") are part of the same
+    # grid and must be retained.
+    index_names = set(ds.indexes)
+    rival_coord_names: set[str] = set()
+    for axis in dup_check_dims:
+        for key in _get_all_axis_coord_keys_safe(ds, axis, multidim):
+            if key in resolved_names:
+                continue
+            coord = ds.coords[key]
+            if not set(coord.dims) & set(da.dims):
+                continue
+            if (
+                key in index_names
+                and set(coord.dims) <= resolved_dims
+                and coord.ndim not in resolved_ranks
+            ):
+                continue
+            rival_coord_names.add(key)
 
-        if isinstance(coords, xr.Dataset):
-            coord = set(
-                [get_dim_coords(ds[data_var], dimension, multidim=multidim).name]
-            )
+    # Drop rival coordinate variables (and only them) so the source grid
+    # describes the selected variable exclusively.
+    to_drop = [name for name in rival_coord_names if name in ds.coords]
+    stripped = ds.drop_vars(to_drop) if to_drop else ds
 
-            dimension_coords = set(ds.cf[[dimension]].coords.keys())
+    # Build the grid from the full stripped dataset, pinning resolution to
+    # the target variable so unrelated axes (e.g., "Z") are still retained.
+    grid = _obj_to_grid_ds(
+        stripped,
+        multidim=multidim,
+        coord_keys=resolved_keymap,
+        target_var=data_var,
+    )
 
-            # need to take the intersection after as `ds.cf[["Z"]]` will hand back data variables
-            to_drop += list(dimension_coords.difference(coord).intersection(all_coords))
+    # Preserve a mask only when it is defined on the resolved grid dims.
+    grid_dims = set(grid.dims)
+    matching_masks = [
+        name
+        for name in ds.data_vars
+        if name == "mask" and set(ds[name].dims) <= grid_dims
+        and set(ds[name].dims) & grid_dims
+    ]
 
-    input_grid = ds.drop_dims(to_drop)
-
-    # drops extra dimensions on input grid
-    grid = _obj_to_grid_ds(input_grid, multidim=multidim)
-
-    # preserve mask on grid
-    if "mask" in ds:
-        grid["mask"] = ds["mask"].copy()
+    if len(matching_masks) > 1:
+        raise ValueError(
+            f"More than one 'mask' variable matches the resolved grid "
+            f"dimensions {sorted(grid_dims)}: {matching_masks}. Rename the "
+            "unrelated masks or keep the mask for the selected variable."
+        )
+    if matching_masks:
+        grid["mask"] = ds[matching_masks[0]].copy()
 
     return grid
+
+
+def _get_all_axis_coord_keys_safe(
+    ds: xr.Dataset, axis: CFAxisKey, multidim: bool
+) -> list[str]:
+    """List axis coordinate keys in the dataset, tolerating ambiguity."""
+    from xcdat.axis import _get_all_coord_keys
+
+    keys = set(_get_all_coord_keys(ds, axis))
+
+    if multidim:
+        return sorted(name for name in keys if ds.coords[name].ndim > 0)
+
+    return sorted(
+        name for name in keys if name in ds.indexes or ds.coords[name].ndim == 1
+    )

@@ -3,7 +3,9 @@
 from xcdat import tutorial  # noqa: F401
 from xcdat._logger import _setup_xcdat_logger
 from xcdat.axis import (  # noqa: F401
+    AmbiguousAxisError,
     center_times,
+    get_axis_coord,
     get_coords_by_name,
     get_dim_coords,
     get_dim_keys,

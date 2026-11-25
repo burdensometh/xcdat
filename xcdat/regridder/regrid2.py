@@ -5,7 +5,7 @@ import sparse as sp
 import xarray as xr
 
 import xcdat as xc
-from xcdat.axis import get_dim_keys
+from xcdat.axis import get_axis_coord
 from xcdat.regridder.base import BaseRegridder, _preserve_bounds
 from xcdat.regridder.grid import create_mask, create_nan_mask
 
@@ -92,14 +92,26 @@ class Regrid2Regridder(BaseRegridder):
         dst_lon_bnds = _get_bounds_ensure_dtype(self._output_grid, "X")
 
         if self._create_nan_mask:
-            src_mask = create_nan_mask(input_data_var, ["Y", "X"]).values
+            src_mask_da = create_nan_mask(input_data_var, ["Y", "X"])
         else:
-            # DataArray to np.ndarray, handle error when None
-            try:
-                src_mask = self._input_grid.get("mask", None).values  # type: ignore
-            except AttributeError:
-                # regrid2 requires a mask, so create one
-                src_mask = create_mask(self._input_grid, ["Y", "X"]).values
+            # Use an existing mask; regrid2 requires a mask, so create one
+            # when the input grid does not provide it.
+            src_mask_da = self._input_grid.get("mask", None)
+            if src_mask_da is None:
+                src_mask_da = create_mask(self._input_grid, ["Y", "X"])
+
+        # Align the mask's horizontal dimension order with the input
+        # variable. This matters for non-index auxiliary coordinates, whose
+        # dimension names differ from their coordinate names.
+        horizontal_dims = [
+            get_axis_coord(input_data_var, ax).dims[0] for ax in ("Y", "X")
+        ]
+        src_mask_da = src_mask_da.transpose(
+            *[d for d in horizontal_dims if d in src_mask_da.dims],
+            ...,
+            missing_dims="ignore",
+        )
+        src_mask = src_mask_da.values
 
         nan_replace = input_data_var.encoding.get("_FillValue", None)
 
@@ -390,23 +402,24 @@ def _get_output_coords(
     output_coords: dict[str, xr.DataArray] = {}
     input_dims = [str(dim) for dim in dv_input.dims]
 
-    # First get the X and Y axes from the output grid.
+    # Map each horizontal input dimension to the corresponding output grid
+    # coordinate. The output adopts the output grid's coordinate/dimension
+    # names. This also handles non-index auxiliary coordinates, whose
+    # coordinate name differs from their backing dimension name.
+    input_dim_to_output: dict[str, xr.DataArray] = {}
     for key in ["X", "Y"]:
-        input_coord = xc.get_dim_coords(dv_input, key)  # type: ignore
+        input_coord = get_axis_coord(dv_input, key)  # type: ignore
         output_coord = xc.get_dim_coords(output_grid, key)  # type: ignore
+        for dim in input_coord.dims:
+            input_dim_to_output[str(dim)] = output_coord  # type: ignore
 
-        output_coords[str(input_coord.name)] = output_coord  # type: ignore
-
-    # Get the remaining axes the input data variable (e.g., "time").
-    for dim in dv_input.dims:
-        if dim not in output_coords:
-            output_coords[str(dim)] = dv_input[dim]
-
-    # Sort the coords to align with order of input data variable dims. Rename
-    # the dictionary keys to match output grid dimensions.
-    output_coords = {
-        str(output_coords[dim].name): output_coords[dim] for dim in input_dims
-    }
+    # Build coords following the input variable's dimension order.
+    for dim in input_dims:
+        if dim in input_dim_to_output:
+            out_coord = input_dim_to_output[dim]
+            output_coords[str(out_coord.name)] = out_coord
+        elif dim in dv_input.coords:
+            output_coords[dim] = dv_input[dim]
 
     return output_coords
 
@@ -696,7 +709,11 @@ _vpertub = np.vectorize(_pertub)
 
 
 def _get_dimension(input_data_var, cf_axis_name):
-    name = get_dim_keys(input_data_var, cf_axis_name)
+    # Resolve the coordinate on the variable (supports non-index auxiliary
+    # coordinates in merged multi-grid datasets), then map it to its backing
+    # dimension and positional axis index.
+    coord = get_axis_coord(input_data_var, cf_axis_name)
+    name = coord.dims[0]
 
     index = input_data_var.dims.index(name)
 

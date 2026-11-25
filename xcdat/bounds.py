@@ -14,7 +14,12 @@ from xarray.coding.cftime_offsets import get_date_type
 from xarray.core.common import contains_cftime_datetimes
 
 from xcdat._logger import _setup_custom_logger
-from xcdat.axis import CF_ATTR_MAP, CFAxisKey, get_dim_coords
+from xcdat.axis import (
+    CF_ATTR_MAP,
+    CFAxisKey,
+    _get_all_coord_keys,
+    get_dim_coords,
+)
 from xcdat.dataset import _get_data_var
 from xcdat.temporal import (
     _contains_datetime_like_objects,
@@ -198,7 +203,10 @@ class BoundsAccessor:
         return ds
 
     def get_bounds(
-        self, axis: CFAxisKey, var_key: str | None = None
+        self,
+        axis: CFAxisKey,
+        var_key: str | None = None,
+        coord_key: str | None = None,
     ) -> xr.Dataset | xr.DataArray:
         """Gets coordinate bounds.
 
@@ -211,6 +219,13 @@ class BoundsAccessor:
             This parameter is useful if you only want the single bounds
             DataArray related to the axis on the variable (e.g., "tas" has
             a "lat" dimension and you want "lat_bnds").
+        coord_key: str | None
+            The key of the specific axis coordinate to get bounds for. This
+            is useful in a merged multi-grid dataset where more than one
+            coordinate maps to the same ``axis`` (e.g., "lon" and "olon" of
+            equal length). The bounds are read from that coordinate's
+            "bounds" attribute and selection applies to this call only. By
+            default None.
 
         Returns
         -------
@@ -226,9 +241,12 @@ class BoundsAccessor:
         KeyError:
             If bounds were not found for the specific ``axis``.
         """
-        self._validate_axis_arg(axis)
+        if coord_key is None:
+            self._validate_axis_arg(axis)
 
-        if var_key is None:
+        if coord_key is not None:
+            bounds_keys = self._get_bounds_from_coord(coord_key)
+        elif var_key is None:
             # Get all bounds keys in the Dataset for this axis.
             bounds_keys = self._get_bounds_keys(axis)
         else:
@@ -502,6 +520,10 @@ class BoundsAccessor:
 
         This method extracts the "bounds" attribute keys from the coordinates
         of the specified axis in the provided xarray DataArray or Dataset.
+        Index (dimension) coordinates take precedence; non-index auxiliary
+        coordinates are only considered when no index coordinate maps to the
+        axis, which keeps legacy single-grid behavior while supporting merged
+        multi-grid datasets.
 
         Parameters:
         -----------
@@ -516,8 +538,28 @@ class BoundsAccessor:
             A list of bounds attribute keys found in the coordinates of the
             specified axis. Otherwise, an empty list is returned.
         """
-        coords_obj = get_dim_coords(obj, axis)
         bounds_keys: list[str] = []
+
+        try:
+            coords_obj = get_dim_coords(obj, axis)
+        except KeyError:
+            coords_obj = None
+
+        if coords_obj is None:
+            # No index coordinate maps to this axis; fall back to non-index
+            # (e.g., auxiliary) coordinates that explicitly reference bounds.
+            index_dims = set(getattr(obj, "indexes", {}).keys())
+            coord_names = [
+                name
+                for name in _get_all_coord_keys(obj, axis)
+                if name in obj.coords
+                and obj.coords[name].ndim > 0
+                and not set(obj.coords[name].dims) & index_dims
+            ]
+            for name in coord_names:
+                bounds_keys = self._extract_bounds_key(obj.coords[name], bounds_keys)
+
+            return bounds_keys
 
         if isinstance(coords_obj, xr.DataArray):
             bounds_keys = self._extract_bounds_key(coords_obj, bounds_keys)
@@ -536,6 +578,42 @@ class BoundsAccessor:
             bounds_keys.append(bnds_key)
 
         return bounds_keys
+
+    def _get_bounds_from_coord(self, coord_key: str) -> list[str]:
+        """Get the bounds key referenced by a specific coordinate variable.
+
+        Parameters
+        ----------
+        coord_key : str
+            The name of the coordinate variable whose bounds are requested.
+
+        Returns
+        -------
+        list[str]
+            A single-element list with the bounds key.
+
+        Raises
+        ------
+        KeyError
+            If the coordinate or its referenced bounds variable do not exist.
+        """
+        if coord_key not in self._dataset.coords:
+            raise KeyError(
+                f"The coordinate '{coord_key}' was not found in the dataset. "
+                f"Available coordinates: "
+                f"{sorted(str(c) for c in self._dataset.coords)}."
+            )
+
+        bounds_key = self._dataset.coords[coord_key].attrs.get("bounds")
+
+        if bounds_key is None or bounds_key not in self._dataset.data_vars:
+            raise KeyError(
+                f"No bounds data variable was found for the coordinate "
+                f"'{coord_key}'. Make sure its 'bounds' attribute points to "
+                "a bounds variable that exists in the dataset."
+            )
+
+        return [bounds_key]
 
     def _create_time_bounds(  # noqa: C901
         self,
@@ -896,7 +974,19 @@ class BoundsAccessor:
                 f"Incorrect 'axis' argument value. Supported values include {keys}."
             )
 
-        get_dim_coords(self._dataset, axis)
+        try:
+            get_dim_coords(self._dataset, axis)
+        except KeyError:
+            # Fall back to non-index (e.g., auxiliary) coordinates, which are
+            # valid axis coordinates in merged multi-grid datasets.
+            coord_keys = [
+                name
+                for name in _get_all_coord_keys(self._dataset, axis)
+                if name in self._dataset.coords
+                and self._dataset.coords[name].ndim > 0
+            ]
+            if not coord_keys:
+                raise
 
 
 def create_bounds(axis: CFAxisKey, coord_var: xr.DataArray) -> xr.DataArray:

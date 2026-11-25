@@ -2,6 +2,27 @@
 History
 =======
 
+Unreleased
+----------
+
+This release makes coordinate, bounds, and mask resolution variable-aware so
+that merged datasets containing multiple same-length grids (e.g., ocean and
+land surface variables) no longer silently mix one variable's data with
+another variable's grid.
+
+Bug Fixes
+~~~~~~~~~
+
+- Resolve axis coordinates, bounds, and masks on the selected data variable
+  for spatial averaging and horizontal/vertical regridding. When more than
+  one coordinate plausibly maps to an axis, an ``AmbiguousAxisError`` is
+  raised instead of silently picking one. A new per-call ``coord_keys``
+  argument on ``spatial.average``, ``regridder.horizontal``,
+  ``regridder.vertical``, and the land/sea mask functions disambiguates the
+  grid for that call only, without changing how any other variable is
+  resolved. Results now match computing each variable from a standalone
+  single-grid file.
+
 v0.11.5 (08 October 2026)
 -------------------------
 
