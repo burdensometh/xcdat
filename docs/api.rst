@@ -102,6 +102,7 @@ Classes
     bounds.BoundsAccessor
     spatial.SpatialAccessor
     temporal.TemporalAccessor
+    circular.CircularAccessor
     regridder.accessor.RegridderAccessor
     regridder.regrid2.Regrid2Regridder
     regridder.xesmf.XESMFRegridder
@@ -141,6 +142,8 @@ Methods
     Dataset.temporal.group_average
     Dataset.temporal.climatology
     Dataset.temporal.departures
+    Dataset.circular.summary
+    Dataset.circular.combine
     Dataset.regridder.horizontal
     Dataset.regridder.vertical
 
@@ -200,6 +203,9 @@ It is especially useful for those who are transitioning over from CDAT to xarray
    * - Calculate climatological departures?
      - ``Dataset.temporal.departures("VAR_KEY", freq=<"season"|"month"|"day">)``, subset results for individual seasons, months, or days
      - ``cdutil.SEASONALCYCLE.departures()``, ``cdutil.ANNUALCYCLE.departures()``, ``cdutil.<DJF|MAM|JJA|SON>.departures()``, ``cdutil.<JAN|FEB|...|DEC>.departures()``
+   * - Summarize angular (direction) data into duration-weighted reports and merge reports by duration?
+     - ``Dataset.circular.summary("VAR_KEY", freq=<"hour"|"day"|"month"|"year">)``, then ``Dataset.circular.combine("VAR_KEY", freq=<"day"|"month"|"year">)``
+     - N/A
    * - Regrid horizontally?
      - ``Dataset.regridder.horizontal(tool="regrid2")``
      - ``cdms2.regrid2()``

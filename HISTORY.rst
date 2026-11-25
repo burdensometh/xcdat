@@ -2,6 +2,21 @@
 History
 =======
 
+Unreleased
+----------
+
+Enhancements
+~~~~~~~~~~~~
+
+- Add the ``Dataset.circular`` accessor for duration-weighted circular
+  (directional) statistics. ``summary()`` creates hourly, daily, monthly, or
+  yearly reports of a direction variable (for example, wind direction) that
+  retain the additive sufficient statistics needed to merge them by duration,
+  and ``combine()`` merges reports to a coarser frequency. Observations that
+  span a reporting-period boundary are split by their actual duration, missing
+  values are excluded, and periods with exactly opposing equal-duration winds
+  are reported as an indeterminate direction.
+
 v0.11.5 (08 October 2026)
 -------------------------
 

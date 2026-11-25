@@ -10,6 +10,7 @@ from xcdat.axis import (  # noqa: F401
     swap_lon_axis,
 )
 from xcdat.bounds import BoundsAccessor, create_bounds  # noqa: F401
+from xcdat.circular import CircularAccessor  # noqa: F401
 from xcdat.dataset import decode_time, open_dataset, open_mfdataset  # noqa: F401
 from xcdat.regridder.accessor import RegridderAccessor  # noqa: F401
 from xcdat.regridder.grid import (  # noqa: F401
